@@ -7,6 +7,22 @@ Entrada més recent a dalt. Format de data: AAAA-MM-DD.
 
 ## 2026-07-14
 
+### ➕ Millora: effort via paràmetre NATIU d'Open WebUI (selector net) — Claude i Codex
+- **Motiu:** tenir 12 opcions (model×effort) al selector era carregós. Millor: 4 models nets + effort a part, com fan les apps de Claude/ChatGPT.
+- **Descoberta:** Open WebUI té un paràmetre natiu `reasoning_effort` (Chat Controls → Advanced Params, o als params del model). Arriba al `body` que rep el pipe (`functions.py:194` passa `form_data` sencer; `payload.py:124` el mapeja).
+- **Canvi:** els dos pipes (`claude_cli_pipe.py`, `codex_pipe.py`) exposen ara **només els models** a `pipes()`. `_resolve_choice()` llegeix l'effort de `body["reasoning_effort"]` (validat contra la llista de nivells), amb fallback a la Valve `EFFORT`.
+- **On es tria l'effort a la UI:** obre **Chat Controls** (icona a dalt dreta del xat) → **Advanced Params** → activa "Reasoning Effort" i escriu `low`/`medium`/`high` (Codex) o fins a `xhigh`/`max` (Claude).
+- Selectors resultants: Claude = Opus/Sonnet/Haiku/Fable · Codex = Sol/Terra/Luna/5.5.
+- Verificat: resolució (model, effort) correcta en tots els casos. ✅
+
+### ➕ Millora: Claude via CLI (`claude -p`) — SENSE token OAuth
+- **Motiu:** el pipe original de Claude (`claude_agent_pipe.py`) requereix generar i enganxar un token OAuth (`claude setup-token`). Com que el CLI `claude` ja està logat a la màquina, es pot fer com Codex: cridar el CLI directament, sense token.
+- **Solució:** pipe nou `integrations/claude_cli_pipe.py` (bessó del de Codex) que fa `claude -p --permission-mode bypassPermissions` amb el prompt per STDIN. Patró copiat del `SaPa-Connect/app/services/ai.py` (línia ~98).
+- **Avantatges:** sense token a manejar, sense dependències pip (`claude-agent-sdk`), consistent amb el pipe de Codex, ~180 línies vs 1600.
+- Exposa models `opus` / `sonnet` / `haiku` / `fable` × effort `low` / `medium` / `high` (12 opcions al selector, igual patró que Codex). El CLI de Claude té `--effort` (nivells: low/medium/high/xhigh/max). Sessions per xat via `--session-id <uuid>` + `--resume`.
+- **Verificat:** respon "Hola, funciono." amb Sonnet i amb Fable+low, sense token. ✅
+- El pipe antic (`claude_agent_pipe.py`, agent complet amb eines) es pot desactivar o mantenir per a tasques agèntiques.
+
 ### ➕ Millora: Codex exposa Sol/Terra/Luna + selecció d'effort al selector
 - CLI de Codex actualitzat 0.139.0 → **0.144.4** (`npm i -g @openai/codex@latest`). Els models GPT-5.6 (Sol/Terra/Luna) requereixen CLI >= 0.144; amb 0.139 donaven error 400 "requires a newer version".
 - Verificat que amb compte Plus funcionen: `gpt-5.6-sol` (flagship, effort medium+), `gpt-5.6-terra` (equilibri), `gpt-5.6-luna` (ràpid), més `gpt-5.5` (fallback).

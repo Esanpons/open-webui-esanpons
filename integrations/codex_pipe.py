@@ -115,39 +115,34 @@ class Pipe:
     _EFFORTS = ["low", "medium", "high"]
 
     def pipes(self) -> List[Dict[str, str]]:
-        # One entry per (model, effort) combination so the picker lets you
-        # choose both at once. The selected pipe id encodes them as
-        # "<model>__<effort>" and is decoded in pipe() (see _resolve_choice).
-        out: List[Dict[str, str]] = []
-        for model_id, model_label in self._MODELS:
-            for effort in self._EFFORTS:
-                out.append(
-                    {
-                        "id": f"{model_id}__{effort}",
-                        "name": f"Codex {model_label} ({effort})",
-                    }
-                )
-        return out
+        # One clean entry per model. Effort is chosen separately via Open
+        # WebUI's native "reasoning_effort" param (Chat Controls → Advanced),
+        # read from the body in _resolve_choice.
+        return [
+            {"id": model_id, "name": f"Codex {label}"}
+            for model_id, label in self._MODELS
+        ]
 
     def _resolve_choice(self, body: Dict[str, Any]) -> "tuple[str, str]":
-        """Decode the picked model+effort from body['model'], which looks like
-        '<function_id>.<model>__<effort>'. Falls back to the Valve defaults."""
+        """Resolve (model, effort). Model comes from the picked pipe id; effort
+        from Open WebUI's native `reasoning_effort` body param (Chat Controls →
+        Advanced Params), falling back to the Valve defaults.
+
+        Model ids contain dots (gpt-5.6-sol), so we match the picked pipe id
+        against the known model list rather than split on '.'."""
         model = self.valves.MODEL.strip() or "gpt-5.5"
         effort = self.valves.EFFORT.strip() or "low"
+
         raw = str(body.get("model", "")) if isinstance(body, dict) else ""
-        # The pipe id is "<function_id>.<model>__<effort>". Both the function
-        # id and the model contain dots, so we can't split on ".". Instead:
-        # the effort is the suffix after the LAST "__", and the model is the
-        # longest known model id that the string ends-with before that "__".
-        if "__" in raw:
-            head, _, cand_effort = raw.rpartition("__")
-            if cand_effort in self._EFFORTS:
-                effort = cand_effort
-            # head ends with "<...>.<model>"; match against known models.
-            for model_id, _label in self._MODELS:
-                if head.endswith(model_id):
-                    model = model_id
-                    break
+        for model_id, _label in self._MODELS:
+            if raw.endswith(model_id):
+                model = model_id
+                break
+
+        native = body.get("reasoning_effort") if isinstance(body, dict) else None
+        if isinstance(native, str) and native.strip().lower() in self._EFFORTS:
+            effort = native.strip().lower()
+
         return model, effort
 
     async def pipe(
