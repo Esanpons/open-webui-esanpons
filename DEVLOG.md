@@ -7,6 +7,12 @@ Entrada més recent a dalt. Format de data: AAAA-MM-DD.
 
 ## 2026-07-14
 
+### ➕ Millora: Codex exposa Sol/Terra/Luna + selecció d'effort al selector
+- CLI de Codex actualitzat 0.139.0 → **0.144.4** (`npm i -g @openai/codex@latest`). Els models GPT-5.6 (Sol/Terra/Luna) requereixen CLI >= 0.144; amb 0.139 donaven error 400 "requires a newer version".
+- Verificat que amb compte Plus funcionen: `gpt-5.6-sol` (flagship, effort medium+), `gpt-5.6-terra` (equilibri), `gpt-5.6-luna` (ràpid), més `gpt-5.5` (fallback).
+- `pipes()` genera ara una entrada per cada combinació **model × effort** (12 opcions: "Codex Sol (high)", "Codex Terra (low)"...). Així es tria model i effort d'un cop des del selector del xat.
+- `_resolve_choice()` descodifica l'ID `<model>__<effort>`. ⚠️ No es pot fer `split(".")` perquè els IDs de model tenen punts (gpt-5.6-sol) → es fa match contra la llista coneguda de models.
+
 ### ➕ Integració: Codex (ChatGPT Plus) via pipe `codex exec` — SENSE proxy ni API
 - **Objectiu:** usar la subscripció **ChatGPT Plus** a Open WebUI (tokens del compte, NO API de pagament).
 - **Descoberta clau:** cap function de la comunitat ho resol (rebutjat oficialment per risc de ToS — veure discussió open-webui #25122). L'única via és cridar el CLI oficial `codex exec`, que usa la sessió `~/.codex/auth.json` (compte ChatGPT).

@@ -90,11 +90,11 @@ class Pipe:
     class Valves(BaseModel):
         EFFORT: str = Field(
             default="low",
-            description='model_reasoning_effort: "low" (fast), "medium", or "high" (deep, spends more quota). Avoid xhigh.',
+            description='DEFAULT effort when the picked model doesn\'t specify one: "low", "medium", or "high". Normally you pick model+effort from the model selector instead.',
         )
         MODEL: str = Field(
             default="gpt-5.5",
-            description="Codex model. Must be one supported by a ChatGPT account (e.g. gpt-5.5). NOTE: gpt-5.1 and API-only models are rejected with a ChatGPT login.",
+            description="DEFAULT model (fallback). Normally you pick the model from the selector. ChatGPT-account models need CLI >= 0.144: gpt-5.6-sol / -terra / -luna, or gpt-5.5. API-only models (gpt-5.1) are rejected.",
         )
         TIMEOUT_SECONDS: int = Field(
             default=300,
@@ -104,8 +104,51 @@ class Pipe:
     def __init__(self) -> None:
         self.valves = self.Valves()
 
+    # Models available to a ChatGPT Plus account via the Codex CLI (needs CLI
+    # >= 0.144). id → display label. gpt-5.5 kept as a stable fallback.
+    _MODELS = [
+        ("gpt-5.6-sol", "Sol"),
+        ("gpt-5.6-terra", "Terra"),
+        ("gpt-5.6-luna", "Luna"),
+        ("gpt-5.5", "5.5"),
+    ]
+    _EFFORTS = ["low", "medium", "high"]
+
     def pipes(self) -> List[Dict[str, str]]:
-        return [{"id": "codex", "name": "Codex (ChatGPT Plus)"}]
+        # One entry per (model, effort) combination so the picker lets you
+        # choose both at once. The selected pipe id encodes them as
+        # "<model>__<effort>" and is decoded in pipe() (see _resolve_choice).
+        out: List[Dict[str, str]] = []
+        for model_id, model_label in self._MODELS:
+            for effort in self._EFFORTS:
+                out.append(
+                    {
+                        "id": f"{model_id}__{effort}",
+                        "name": f"Codex {model_label} ({effort})",
+                    }
+                )
+        return out
+
+    def _resolve_choice(self, body: Dict[str, Any]) -> "tuple[str, str]":
+        """Decode the picked model+effort from body['model'], which looks like
+        '<function_id>.<model>__<effort>'. Falls back to the Valve defaults."""
+        model = self.valves.MODEL.strip() or "gpt-5.5"
+        effort = self.valves.EFFORT.strip() or "low"
+        raw = str(body.get("model", "")) if isinstance(body, dict) else ""
+        # The pipe id is "<function_id>.<model>__<effort>". Both the function
+        # id and the model contain dots, so we can't split on ".". Instead:
+        # the effort is the suffix after the LAST "__", and the model is the
+        # longest known model id that the string ends-with before that "__".
+        if "__" in raw:
+            head, _, cand_effort = raw.rpartition("__")
+            if cand_effort in self._EFFORTS:
+                effort = cand_effort
+            # head ends with "<...>.<model>"; match against known models.
+            for model_id, _label in self._MODELS:
+                if head.endswith(model_id):
+                    model = model_id
+                    break
+        return model, effort
 
     async def pipe(
         self,
@@ -122,6 +165,7 @@ class Pipe:
 
         chat_id = __chat_id__ or "default"
         resume_sid = _chat_sessions.get(chat_id)
+        model, effort = self._resolve_choice(body)
 
         async def emit_status(description: str, done: bool = False) -> None:
             if __event_emitter__ is None:
@@ -149,12 +193,12 @@ class Pipe:
         cmd += [
             "--skip-git-repo-check",
             "-c",
-            f"model_reasoning_effort={self.valves.EFFORT}",
+            f"model_reasoning_effort={effort}",
             "--output-last-message",
             msg_path,
         ]
-        if self.valves.MODEL.strip():
-            cmd += ["--model", self.valves.MODEL.strip()]
+        if model:
+            cmd += ["--model", model]
         if not resume_sid:
             # `resume` rejects -s; the sandbox goes via config on follow-ups.
             cmd += ["-s", "read-only"]
