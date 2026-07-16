@@ -37,6 +37,28 @@ log = logging.getLogger(__name__)
 # chat_id -> session uuid, so follow-up turns resume the same Claude session.
 _chat_sessions: Dict[str, str] = {}
 
+# Màxim de CLIs `claude` concurrents des d'aquest backend. Sense límit, les
+# taules rodones amb diversos canals actius poden llançar >10 processos alhora
+# que es bloquegen entre ells (locks del CLI) i queden penjats per sempre.
+_MAX_CONCURRENT = 2
+_semaphore: "asyncio.Semaphore | None" = None
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    global _semaphore
+    if _semaphore is None:
+        _semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+    return _semaphore
+
+
+def _collab_ctx(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Context de l'espai col·laboratiu (channels amb /collab). Arriba com a
+    __metadata__['collab'] en crides directes (hand-raise) o com a
+    __metadata__['variables']['collab'] via el pipeline complet (torns)."""
+    md = metadata or {}
+    ctx = md.get("collab") or (md.get("variables") or {}).get("collab") or {}
+    return ctx if isinstance(ctx, dict) else {}
+
 
 def _resolve_claude() -> List[str]:
     """Return the argv prefix to invoke the claude CLI, handling the Windows
@@ -50,6 +72,18 @@ def _resolve_claude() -> List[str]:
         if low.endswith((".cmd", ".bat")):
             return ["cmd", "/c", exe]
     return [exe]
+
+
+def _extract_system_prompt(body: Dict[str, Any]) -> str:
+    """El pipeline (i l'espai col·laboratiu) passen instruccions com a missatge
+    role=system; el CLI només rep el prompt per STDIN, així que cal
+    incorporar-les-hi explícitament."""
+    for message in body.get("messages") or []:
+        if message.get("role") == "system":
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+    return ""
 
 
 def _extract_latest_user_prompt(body: Dict[str, Any]) -> str:
@@ -140,7 +174,23 @@ class Pipe:
             yield "_No user message to send to Claude._"
             return
 
-        chat_id = __chat_id__ or "default"
+        system = _extract_system_prompt(body)
+        if system:
+            prompt = f"[Instruccions del sistema]\n{system}\n\n[Missatge]\n{prompt}"
+
+        # Espai col·laboratiu: amb carpeta-projecte, Claude corre des d'allà
+        # (com `claude` al terminal dins la carpeta). Les crides de "mà alçada"
+        # (vols intervenir?) són one-shot: sense sessió, per no embrutar la
+        # conversa del canal.
+        collab = _collab_ctx(__metadata__)
+        project_dir = collab.get("project_dir")
+        if project_dir and not os.path.isdir(project_dir):
+            project_dir = None
+        is_handraise = collab.get("task") == "handraise"
+
+        chat_id = __chat_id__ or collab.get("channel_id") or "default"
+        session_key = f"{chat_id}|{project_dir}" if project_dir else chat_id
+
         model, effort = self._resolve_choice(body)
 
         async def emit_status(description: str, done: bool = False) -> None:
@@ -157,33 +207,43 @@ class Pipe:
             cmd += ["--effort", effort]
 
         # Session handling: reuse the same session per chat so context carries.
-        existing_sid = _chat_sessions.get(chat_id)
+        # Handraise: one-shot, cap sessió.
+        existing_sid = None if is_handraise else _chat_sessions.get(session_key)
         if existing_sid:
             cmd += ["--resume", existing_sid]
             await emit_status(f"🧠 Claude {model} · {effort} (continuant)…")
+        elif is_handraise:
+            await emit_status(f"✋ Claude {model} decideix si intervé…")
         else:
             new_sid = str(uuid.uuid4())
             cmd += ["--session-id", new_sid]
-            _chat_sessions[chat_id] = new_sid
+            _chat_sessions[session_key] = new_sid
             await emit_status(f"🧠 Claude {model} · {effort}…")
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(input=prompt.encode("utf-8")),
-                    timeout=self.valves.TIMEOUT_SECONDS,
+            async with _get_semaphore():
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=project_dir,  # None → cwd del backend, com sempre
                 )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await emit_status("Timeout.", done=True)
-                yield f"\n\n**Claude error:** timed out after {self.valves.TIMEOUT_SECONDS}s.\n"
-                return
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        proc.communicate(input=prompt.encode("utf-8")),
+                        timeout=self.valves.TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await emit_status("Timeout.", done=True)
+                    yield f"\n\n**Claude error:** timed out after {self.valves.TIMEOUT_SECONDS}s.\n"
+                    return
+                except asyncio.CancelledError:
+                    # Qui ens crida (p.ex. el timeout de mà alçada de la taula
+                    # rodona) ha cancel·lat: mata el CLI perquè no quedi zombi.
+                    proc.kill()
+                    raise
 
             answer = (stdout_bytes or b"").decode("utf-8", errors="replace").strip()
             errtext = (stderr_bytes or b"").decode("utf-8", errors="replace").strip()
@@ -199,7 +259,7 @@ class Pipe:
                     f"<details>\n<summary>Sortida (stderr)</summary>\n\n```\n{tail}\n```\n\n</details>\n"
                 )
                 # If resume failed (stale session), drop it so the next turn starts fresh.
-                _chat_sessions.pop(chat_id, None)
+                _chat_sessions.pop(session_key, None)
         except Exception as exc:
             log.exception("Claude CLI pipe failed")
             import traceback as _tb

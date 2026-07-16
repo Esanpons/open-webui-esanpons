@@ -25,7 +25,13 @@
 	import i18n from '$lib/i18n';
 	import Spinner from '../common/Spinner.svelte';
 
+	// [collab-fork] Panell de l'espai col·laboratiu (taula rodona d'IAs)
+	import CollabPanel from '../collab/CollabPanel.svelte';
+
 	export let id = '';
+
+	// [collab-fork]
+	let showCollabPanel = false;
 
 	let currentId = null;
 
@@ -334,6 +340,15 @@
 				}}
 			/>
 
+			<!-- [collab-fork] botó del panell de la taula rodona -->
+			<button
+				class="absolute top-12 right-4 z-20 size-9 rounded-full bg-white dark:bg-gray-850 shadow-md border border-gray-100 dark:border-gray-800 hover:scale-105 transition text-base"
+				title="Taula rodona (espai col·laboratiu)"
+				on:click={() => (showCollabPanel = !showCollabPanel)}
+			>
+				🤝
+			</button>
+
 			{#if channel && messages !== null}
 				<div class="flex-1 overflow-y-auto">
 					<div
@@ -448,6 +463,51 @@
 					/>
 				</div>
 			</Pane>
+		{/if}
+
+		<!-- [collab-fork] panell de la taula rodona (mateix patró que Thread) -->
+		{#if showCollabPanel}
+			{#if !largeScreen}
+				<Drawer
+					show={showCollabPanel}
+					onClose={() => {
+						showCollabPanel = false;
+					}}
+				>
+					<div class="h-screen w-full relative">
+						{#key id}
+							<CollabPanel
+								channelId={id}
+								onClose={() => {
+									showCollabPanel = false;
+								}}
+							/>
+						{/key}
+					</div>
+				</Drawer>
+			{:else}
+				<PaneResizer
+					class="relative flex items-center justify-center group border-l border-gray-50 dark:border-gray-850/30 hover:border-gray-200 dark:hover:border-gray-800 transition z-20"
+					id="collab-resizer"
+				>
+					<div
+						class=" absolute -left-1.5 -right-1.5 -top-0 -bottom-0 z-20 cursor-col-resize bg-transparent"
+					/>
+				</PaneResizer>
+
+				<Pane defaultSize={35} minSize={25} class="h-full w-full relative">
+					<div class="h-full w-full shadow-xl relative">
+						{#key id}
+							<CollabPanel
+								channelId={id}
+								onClose={() => {
+									showCollabPanel = false;
+								}}
+							/>
+						{/key}
+					</div>
+				</Pane>
+			{/if}
 		{/if}
 	</PaneGroup>
 </div>

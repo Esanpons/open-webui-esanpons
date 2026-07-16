@@ -1218,7 +1218,20 @@ async def post_new_message(
         # Background tasks should manage their own short-lived sessions to avoid
         # holding database connections during slow operations (e.g., LLM calls).
         async def background_handler():
-            await model_response_handler(request, channel, message, user)
+            # [collab-fork] Espai col·laboratiu multi-agent: si el canal té el
+            # mode actiu (channel.meta['collab']) o el missatge és una comanda
+            # /collab, el gestiona l'orquestrador i se salta el handler
+            # estàndard de mencions. Vegeu docs/plans/espai-collaboratiu.md.
+            collab_handled = False
+            try:
+                from open_webui.collab import handle_collab_message
+
+                collab_handled = await handle_collab_message(request, channel, message, user)
+            except Exception as e:
+                log.exception(e)
+
+            if not collab_handled:
+                await model_response_handler(request, channel, message, user)
             await send_notification(
                 request,
                 channel,

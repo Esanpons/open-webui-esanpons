@@ -65,6 +65,20 @@ log = logging.getLogger(__name__)
 _chat_sessions: Dict[str, str] = {}
 
 
+def _collab_ctx(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Context de l'espai col·laboratiu (channels amb /collab). Arriba com a
+    __metadata__['collab'] en crides directes (hand-raise) o com a
+    __metadata__['variables']['collab'] via el pipeline complet (torns)."""
+    md = metadata or {}
+    ctx = md.get("collab") or (md.get("variables") or {}).get("collab") or {}
+    return ctx if isinstance(ctx, dict) else {}
+
+
+def _safe_dir_name(chat_id: str) -> str:
+    # chat_id pot dur ':' (p.ex. "channel:<uuid>"), invàlid en carpetes Windows.
+    return re.sub(r'[<>:"/\\|?*]', "_", chat_id)
+
+
 _TOOL_PREVIEW_FIELDS = {
     "Bash": "command",
     "Read": "file_path",
@@ -1405,9 +1419,23 @@ class Pipe:
         # Fast path disabled — always run the full agent loop.
         prompt = _strip_mode_prefix(prompt)
 
-        chat_id = __chat_id__ or "default"
-        workdir = Path(self.valves.WORKDIR_ROOT) / chat_id
-        workdir.mkdir(parents=True, exist_ok=True)
+        # Espai col·laboratiu: si el torn arriba amb carpeta-projecte
+        # (`/collab dir ...` al canal), treballem directament allà — com obrir
+        # Claude Code des d'aquella carpeta al terminal. Si no, workspace
+        # per-chat de sempre. Les crides de "mà alçada" són one-shot (sense
+        # resume, no embruten la sessió del canal).
+        collab = _collab_ctx(__metadata__)
+        is_handraise = collab.get("task") == "handraise"
+        chat_id = __chat_id__ or collab.get("channel_id") or "default"
+
+        collab_dir = collab.get("project_dir")
+        if collab_dir and Path(collab_dir).is_dir():
+            workdir = Path(collab_dir)
+            session_key = f"{chat_id}|{collab_dir}"
+        else:
+            workdir = Path(self.valves.WORKDIR_ROOT) / _safe_dir_name(chat_id)
+            workdir.mkdir(parents=True, exist_ok=True)
+            session_key = chat_id
 
         # Resolve the model from the picker. body["model"] looks like
         # "<function_id>.<pipe_id>"; the pipe_id is the real Claude model ID
@@ -1422,7 +1450,7 @@ class Pipe:
         allowed_tools = [
             t.strip() for t in self.valves.ALLOWED_TOOLS.split(",") if t.strip()
         ]
-        resume_id = _chat_sessions.get(chat_id)
+        resume_id = None if is_handraise else _chat_sessions.get(session_key)
 
         # Knowledge base attached via Workspace Model → expose as an MCP tool
         # Claude can call agentically. OpenWebUI's middleware already added one
@@ -1529,8 +1557,8 @@ class Pipe:
                     if isinstance(message, SystemMessage):
                         if message.subtype == "init":
                             session_id = message.data.get("session_id")
-                            if session_id:
-                                _chat_sessions[chat_id] = session_id
+                            if session_id and not is_handraise:
+                                _chat_sessions[session_key] = session_id
                         continue
 
                     if isinstance(message, StreamEvent):

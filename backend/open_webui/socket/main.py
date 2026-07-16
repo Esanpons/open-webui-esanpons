@@ -857,8 +857,43 @@ async def _make_channel_emitter(request_info):
     channel_id = request_info['chat_id'].removeprefix('channel:')
     message_id = request_info['message_id']
 
-    state = {'last_emit_at': 0.0}
+    state = {'last_emit_at': 0.0, 'acc': ''}
     THROTTLE_INTERVAL = 0.15  # ~6 updates/sec
+
+    def _extract_content(data: dict) -> str:
+        # [collab-fork] El pipeline emet chat:completion en formes diverses:
+        # llegat {'content': ...}, deltas OpenAI (choices[].delta.content),
+        # respostes completes (choices[].message.content) i el final amb
+        # 'output' items (output_text). Acumulem deltas a state['acc'] perquè
+        # el missatge del canal es vagi omplint i el 'done' no el buidi.
+        content = data.get('content', '')
+        if isinstance(content, str) and content:
+            state['acc'] = content
+            return state['acc']
+
+        choices = data.get('choices') or []
+        if choices:
+            choice = choices[0] or {}
+            piece = (choice.get('delta') or {}).get('content')
+            if isinstance(piece, str) and piece:
+                state['acc'] += piece
+                return state['acc']
+            message_content = (choice.get('message') or {}).get('content')
+            if isinstance(message_content, str) and message_content:
+                state['acc'] = message_content
+                return state['acc']
+
+        texts = []
+        for item in data.get('output') or []:
+            if item.get('type') == 'message':
+                for part in item.get('content') or []:
+                    if part.get('type') == 'output_text' and part.get('text'):
+                        texts.append(part['text'])
+        if texts:
+            state['acc'] = '\n\n'.join(texts)
+            return state['acc']
+
+        return state['acc'] if data.get('done') else ''
 
     async def _emit_channel_update(content: str, done: bool = False):
         from open_webui.models.messages import MessageForm, Messages
@@ -897,7 +932,7 @@ async def _make_channel_emitter(request_info):
 
         if event_type == 'chat:completion':
             data = event_data.get('data', {})
-            content = data.get('content', '')
+            content = _extract_content(data)  # [collab-fork]
             done = data.get('done', False)
 
             if not content and not done:

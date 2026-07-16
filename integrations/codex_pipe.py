@@ -39,7 +39,28 @@ log = logging.getLogger(__name__)
 # chat_id -> codex_session_id, so follow-up turns resume the same Codex session.
 _chat_sessions: Dict[str, str] = {}
 
+# Màxim de CLIs `codex` concurrents des d'aquest backend (evita processos
+# penjats per contenció quan diverses taules rodones treballen alhora).
+_MAX_CONCURRENT = 2
+_semaphore: "asyncio.Semaphore | None" = None
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    global _semaphore
+    if _semaphore is None:
+        _semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+    return _semaphore
+
 _SESSION_ID_RE = re.compile(r"session id:\s*([0-9a-fA-F-]{8,})")
+
+
+def _collab_ctx(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Context de l'espai col·laboratiu (channels amb /collab). Arriba com a
+    __metadata__['collab'] en crides directes (hand-raise) o com a
+    __metadata__['variables']['collab'] via el pipeline complet (torns)."""
+    md = metadata or {}
+    ctx = md.get("collab") or (md.get("variables") or {}).get("collab") or {}
+    return ctx if isinstance(ctx, dict) else {}
 
 
 def _codex_base() -> List[str]:
@@ -66,6 +87,18 @@ def _codex_base() -> List[str]:
     raise RuntimeError(
         "Codex CLI not found (neither the shim nor codex.js). Check `codex --version`."
     )
+
+
+def _extract_system_prompt(body: Dict[str, Any]) -> str:
+    """El pipeline (i l'espai col·laboratiu) passen instruccions com a missatge
+    role=system; el CLI només rep el prompt per STDIN, així que cal
+    incorporar-les-hi explícitament."""
+    for message in body.get("messages") or []:
+        if message.get("role") == "system":
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+    return ""
 
 
 def _extract_latest_user_prompt(body: Dict[str, Any]) -> str:
@@ -99,6 +132,18 @@ class Pipe:
         TIMEOUT_SECONDS: int = Field(
             default=300,
             description="Max seconds to wait for a Codex reply before giving up.",
+        )
+        COLLAB_SANDBOX: str = Field(
+            default="danger-full-access",
+            description=(
+                "Sandbox de Codex quan el torn ve d'un espai col·laboratiu amb "
+                "carpeta-projecte (perquè pugui editar fitxers): read-only, "
+                "workspace-write o danger-full-access. En aquesta màquina el "
+                "sandbox natiu falla sota AzureAD, per això el default és "
+                "danger-full-access — Codex escriu al projecte SENSE sandbox: "
+                "usa només carpetes de confiança. Els xats normals segueixen "
+                "sent read-only."
+            ),
         )
 
     def __init__(self) -> None:
@@ -158,8 +203,23 @@ class Pipe:
             yield "_No user message to send to Codex._"
             return
 
-        chat_id = __chat_id__ or "default"
-        resume_sid = _chat_sessions.get(chat_id)
+        system = _extract_system_prompt(body)
+        if system:
+            prompt = f"[Instruccions del sistema]\n{system}\n\n[Missatge]\n{prompt}"
+
+        # Espai col·laboratiu: amb carpeta-projecte, Codex corre des d'allà
+        # (com `codex` al terminal dins la carpeta) i amb sandbox d'escriptura.
+        # Les crides de "mà alçada" (vols intervenir?) són one-shot, sense sessió.
+        collab = _collab_ctx(__metadata__)
+        project_dir = collab.get("project_dir")
+        if project_dir and not os.path.isdir(project_dir):
+            project_dir = None
+        is_handraise = collab.get("task") == "handraise"
+
+        chat_id = __chat_id__ or collab.get("channel_id") or "default"
+        session_key = f"{chat_id}|{project_dir}" if project_dir else chat_id
+
+        resume_sid = None if is_handraise else _chat_sessions.get(session_key)
         model, effort = self._resolve_choice(body)
 
         async def emit_status(description: str, done: bool = False) -> None:
@@ -196,7 +256,8 @@ class Pipe:
             cmd += ["--model", model]
         if not resume_sid:
             # `resume` rejects -s; the sandbox goes via config on follow-ups.
-            cmd += ["-s", "read-only"]
+            sandbox = self.valves.COLLAB_SANDBOX.strip() if project_dir else "read-only"
+            cmd += ["-s", sandbox or "read-only"]
         cmd += ["-"]  # read the prompt from STDIN
 
         await emit_status(
@@ -204,22 +265,27 @@ class Pipe:
         )
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            try:
-                stdout_bytes, _ = await asyncio.wait_for(
-                    proc.communicate(input=prompt.encode("utf-8")),
-                    timeout=self.valves.TIMEOUT_SECONDS,
+            async with _get_semaphore():
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=project_dir,  # None → cwd del backend, com sempre
                 )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await emit_status("Timeout.", done=True)
-                yield f"\n\n**Codex error:** timed out after {self.valves.TIMEOUT_SECONDS}s.\n"
-                return
+                try:
+                    stdout_bytes, _ = await asyncio.wait_for(
+                        proc.communicate(input=prompt.encode("utf-8")),
+                        timeout=self.valves.TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await emit_status("Timeout.", done=True)
+                    yield f"\n\n**Codex error:** timed out after {self.valves.TIMEOUT_SECONDS}s.\n"
+                    return
+                except asyncio.CancelledError:
+                    proc.kill()
+                    raise
 
             logs = (stdout_bytes or b"").decode("utf-8", errors="replace")
 
@@ -233,8 +299,8 @@ class Pipe:
             # Capture / refresh the Codex session id for follow-up turns.
             match = _SESSION_ID_RE.search(logs)
             sid = match.group(1) if match else resume_sid
-            if sid:
-                _chat_sessions[chat_id] = sid
+            if sid and not is_handraise:
+                _chat_sessions[session_key] = sid
 
             await emit_status("Done.", done=True)
 

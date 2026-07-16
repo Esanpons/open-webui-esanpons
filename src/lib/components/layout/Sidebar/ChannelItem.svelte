@@ -159,6 +159,10 @@
 					<span class="line-clamp-1">
 						{channel.name}
 					</span>
+					<!-- [collab-fork] badge d'espai col·laboratiu actiu -->
+					{#if channel?.meta?.collab?.enabled}
+						<span class="shrink-0 text-xs" title="Espai col·laboratiu (taula rodona) actiu">🤝</span>
+					{/if}
 				{:else}
 					<span class="shrink-0 line-clamp-1">
 						{channel?.users

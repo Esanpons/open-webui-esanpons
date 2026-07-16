@@ -746,6 +746,13 @@ app.include_router(users.router, prefix='/api/v1/users', tags=['users'])
 
 
 app.include_router(channels.router, prefix='/api/v1/channels', tags=['channels'])
+
+# [collab-fork] Espai col·laboratiu multi-agent — API del panell (config,
+# carpeta-projecte, arbre de fitxers, start/stop). Vegeu
+# docs/plans/espai-collaboratiu.md i backend/open_webui/collab/.
+from open_webui.collab.router import router as collab_router  # noqa: E402
+
+app.include_router(collab_router, prefix='/api/v1/collab', tags=['collab'])
 app.include_router(chats.router, prefix='/api/v1/chats', tags=['chats'])
 app.include_router(notes.router, prefix='/api/v1/notes', tags=['notes'])
 
