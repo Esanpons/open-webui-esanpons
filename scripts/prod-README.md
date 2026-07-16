@@ -48,6 +48,8 @@ res.
 La **taula rodona viu dins d'un canal**, no a Workspace → Models. Detall complet a
 [`docs/collab-workspace.md`](../docs/collab-workspace.md#installacio-nova-que-cal-activar).
 
+Per generar imatges des dels xats de Codex: [`docs/codex-imatges.md`](../docs/codex-imatges.md).
+
 ## Posar una versió nova del codi
 
 Quan hagis fet canvis al repo i els vulguis a producció, **des del repo**:

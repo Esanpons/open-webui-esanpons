@@ -21,8 +21,18 @@ license: MIT
 # context is preserved per OpenWebUI chat_id.
 #
 # Sandbox: this machine's Codex sandbox is broken under AzureAD
-# (CreateProcessAsUserW failed: 5), but chat is text-only, so we run read-only
-# (Codex answers questions / reviews pasted code but does not touch files).
+# (CreateProcessAsUserW failed: 5) — PowerShell child processes get denied, so
+# Codex falls back to node_repl for file ops. It still works.
+#
+# Images (IMAGE_GENERATION valve): Codex has a built-in `image_gen` tool
+# (gpt-image-2) billed against the ChatGPT subscription. It needs
+# `image_generation = true` under [features] in ~/.codex/config.toml — without
+# it Codex claims it will generate images and then silently doesn't.
+# Plain chats get a writable folder under CACHE_DIR/codex_images/<chat_id> and
+# run there with workspace-write (read-only before, which left generated images
+# stranded in $CODEX_HOME). New images are detected after the turn and rendered
+# inline via /cache/... (main.py: serve_cache_file). Collab turns with a project
+# folder keep their own sandbox and are unaffected.
 
 import asyncio
 import logging
@@ -101,6 +111,48 @@ def _extract_system_prompt(body: Dict[str, Any]) -> str:
     return ""
 
 
+def _images_dir(chat_id: str) -> Optional[str]:
+    """Carpeta on Codex desa les imatges d'aquest xat.
+
+    Ha de viure sota CACHE_DIR (= DATA_DIR/cache) perquè el backend només serveix
+    fitxers d'allà per /cache/... (main.py: serve_cache_file, amb protecció de
+    path traversal). Retorna None si no la podem crear."""
+    try:
+        from open_webui.config import CACHE_DIR
+
+        safe = re.sub(r"[^A-Za-z0-9_-]", "_", chat_id or "default")[:64]
+        d = os.path.join(str(CACHE_DIR), "codex_images", safe)
+        os.makedirs(d, exist_ok=True)
+        return d
+    except Exception:
+        log.exception("no he pogut preparar la carpeta d'imatges de Codex")
+        return None
+
+
+def _new_images(directory: str, coneguts: set) -> List[str]:
+    """Imatges noves aparegudes a `directory` (no recursiu) des de l'últim torn."""
+    if not directory or not os.path.isdir(directory):
+        return []
+    exts = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+    trobades = [
+        f for f in os.listdir(directory)
+        if f.lower().endswith(exts) and os.path.isfile(os.path.join(directory, f))
+    ]
+    return sorted(set(trobades) - coneguts)
+
+
+def _markdown_images(chat_id: str, directory: str, noms: List[str]) -> str:
+    """Enllaços markdown que el xat renderitza inline via /cache/..."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", chat_id or "default")[:64]
+    parts = []
+    for n in noms:
+        # cache-buster: sense ell, reeditar una imatge amb el mateix nom mostra
+        # la versió antiga del navegador.
+        mtime = int(os.path.getmtime(os.path.join(directory, n)))
+        parts.append(f"![{n}](/cache/codex_images/{safe}/{n}?v={mtime})")
+    return "\n\n".join(parts)
+
+
 def _extract_latest_user_prompt(body: Dict[str, Any]) -> str:
     for message in reversed(body.get("messages") or []):
         if message.get("role") != "user":
@@ -132,6 +184,17 @@ class Pipe:
         TIMEOUT_SECONDS: int = Field(
             default=300,
             description="Max seconds to wait for a Codex reply before giving up.",
+        )
+        IMAGE_GENERATION: bool = Field(
+            default=True,
+            description=(
+                "Deixa que Codex generi imatges als xats normals (gpt-image-2, "
+                "facturat contra la subscripció de ChatGPT). Les desa a "
+                "DATA_DIR/cache/codex_images/<chat> i el xat les mostra inline. "
+                "Requereix `image_generation = true` a [features] de "
+                "~/.codex/config.toml. Amb això, els xats corren amb "
+                "workspace-write limitat a la carpeta d'imatges (no read-only)."
+            ),
         )
         COLLAB_SANDBOX: str = Field(
             default="danger-full-access",
@@ -222,6 +285,24 @@ class Pipe:
         resume_sid = None if is_handraise else _chat_sessions.get(session_key)
         model, effort = self._resolve_choice(body)
 
+        # Imatges: als xats normals (sense carpeta-projecte) donem a Codex una
+        # carpeta d'escriptura dins el cache. Sense això corria read-only i,
+        # encara que generés la imatge, no la podia desar enlloc visible.
+        img_dir = None
+        img_abans: set = set()
+        if self.valves.IMAGE_GENERATION and not project_dir and not is_handraise:
+            img_dir = _images_dir(chat_id)
+            if img_dir:
+                img_abans = set(_new_images(img_dir, set()))
+                prompt += (
+                    "\n\n[Context de l'entorn]\n"
+                    "Estàs responent dins d'un xat d'Open WebUI, no d'un terminal.\n"
+                    f"Si generes o edites imatges, desa-les a: {img_dir}\n"
+                    "Fes servir noms curts i descriptius (ex. cargol.png). "
+                    "L'usuari les veurà al xat automàticament: no cal que li'n "
+                    "donis la ruta ni que les copiïs enlloc més."
+                )
+
         async def emit_status(description: str, done: bool = False) -> None:
             if __event_emitter__ is None:
                 return
@@ -256,8 +337,15 @@ class Pipe:
             cmd += ["--model", model]
         if not resume_sid:
             # `resume` rejects -s; the sandbox goes via config on follow-ups.
-            sandbox = self.valves.COLLAB_SANDBOX.strip() if project_dir else "read-only"
-            cmd += ["-s", sandbox or "read-only"]
+            if project_dir:
+                sandbox = self.valves.COLLAB_SANDBOX.strip() or "read-only"
+            elif img_dir:
+                # Xat normal amb imatges: pot escriure, però només a img_dir
+                # (hi correm a dins, i workspace-write limita l'escriptura al cwd).
+                sandbox = "workspace-write"
+            else:
+                sandbox = "read-only"
+            cmd += ["-s", sandbox]
         cmd += ["-"]  # read the prompt from STDIN
 
         await emit_status(
@@ -271,7 +359,8 @@ class Pipe:
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
-                    cwd=project_dir,  # None → cwd del backend, com sempre
+                    # carpeta-projecte > carpeta d'imatges > cwd del backend
+                    cwd=project_dir or img_dir,
                 )
                 try:
                     stdout_bytes, _ = await asyncio.wait_for(
@@ -302,10 +391,20 @@ class Pipe:
             if sid and not is_handraise:
                 _chat_sessions[session_key] = sid
 
+            # Imatges noves generades en aquest torn → markdown inline.
+            imatges = ""
+            if img_dir:
+                noves = _new_images(img_dir, img_abans)
+                if noves:
+                    imatges = "\n\n" + _markdown_images(chat_id, img_dir, noves)
+
             await emit_status("Done.", done=True)
 
             if answer:
-                yield answer
+                yield answer + imatges
+            elif imatges:
+                # Ha generat la imatge però no ha dit res: la imatge ja és la resposta.
+                yield imatges.lstrip()
             else:
                 tail = logs[-1500:] if logs else "(no output)"
                 yield (
