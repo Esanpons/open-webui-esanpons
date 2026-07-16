@@ -12,7 +12,14 @@
     Uso:
         ./scripts/dev-start.ps1                # arranca todo y abre el navegador
         ./scripts/dev-start.ps1 -NoBrowser     # no abre el navegador
-        ./scripts/dev-start.ps1 -BackendPort 8081 -FrontendPort 5174
+        ./scripts/dev-start.ps1 -FrontendPort 5174
+
+    OJO con -BackendPort: el frontend tiene el 8080 HARDCODEADO en src/lib/constants.ts
+    (`${location.hostname}:8080`), asi que si lo cambias el frontend seguira buscando el
+    8080 y no lo encontrara. Solo sirve para comprobar que el backend arranca suelto.
+
+    Puertos: dev backend 8080 / dev frontend 5173. PRODUCCION usa el 8090 aparte
+    (D:\open-webui-production\start.bat) para que puedan convivir los dos a la vez.
 #>
 
 [CmdletBinding()]
@@ -41,6 +48,28 @@ if (-not (Test-Path $Uvicorn)) {
 }
 if (-not (Test-Path (Join-Path $RepoRoot "node_modules"))) {
     Write-Host "AVISO: no hay node_modules. Ejecuta antes: npm install --engine-strict=false" -ForegroundColor Yellow
+}
+
+# Puertos libres. Sin esto uvicorn falla con "[Errno 10048] ... solo se permite un uso de
+# cada direccion de socket", el error queda sepultado bajo los warnings de Svelte, Vite se
+# va a otro puerto y acabas mirando un frontend sin backend (o peor: hablando con el de
+# PRODUCCION, que usa el 8090 justamente para evitarlo).
+foreach ($check in @(@{ Port = $BackendPort; Que = "backend" }, @{ Port = $FrontendPort; Que = "frontend" })) {
+    $busy = Get-NetTCPConnection -LocalPort $check.Port -State Listen -ErrorAction SilentlyContinue
+    if (-not $busy) { continue }
+
+    $owner = Get-Process -Id ($busy | Select-Object -First 1 -ExpandProperty OwningProcess) -ErrorAction SilentlyContinue
+    Write-Host ""
+    Write-Host "ERROR: el puerto $($check.Port) ($($check.Que)) ya esta ocupado por:" -ForegroundColor Red
+    Write-Host "       PID $($owner.Id)  $($owner.Path)" -ForegroundColor Red
+    Write-Host ""
+    if ($owner.Path -like "*open-webui-production*" -and $check.Port -ne 8090) {
+        Write-Host "       Es el Open WebUI de PRODUCCION, que deberia estar en el 8090." -ForegroundColor Yellow
+        Write-Host "       Si sigue tomando este puerto, revisa scripts\prod-common.ps1." -ForegroundColor Yellow
+    }
+    Write-Host "       Cierralo con:  taskkill /PID $($owner.Id) /T /F" -ForegroundColor Yellow
+    Write-Host ""
+    exit 1
 }
 
 # Clave secreta de dev (persistente entre arranques para no invalidar sesiones)

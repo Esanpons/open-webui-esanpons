@@ -164,7 +164,7 @@ class Pipe:
         # WebUI's native "reasoning_effort" param (Chat Controls → Advanced),
         # read from the body in _resolve_choice.
         return [
-            {"id": model_id, "name": f"Codex {label}"}
+            {"id": model_id, "name": f"Codex {label} (CLI)"}
             for model_id, label in self._MODELS
         ]
 

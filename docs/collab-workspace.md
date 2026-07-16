@@ -4,6 +4,10 @@ Funcionalitat pròpia d'aquest fork: converteix qualsevol **canal** d'Open WebUI
 
 > Pla de disseny i registre d'execució: [`docs/plans/espai-collaboratiu.md`](plans/espai-collaboratiu.md) · Detall cronològic: `DEVLOG.md`.
 
+> **On és?** La taula rodona viu **dins d'un canal**, no a Workspace → Models. No és un
+> model ni una pipe: no apareixerà mai a `/workspace/models`. Si acabes d'instal·lar,
+> comença per [Instal·lació nova](#installacio-nova-que-cal-activar).
+
 ## Com s'usa (2 minuts)
 
 1. Activa **Channels** (Admin Settings → General) si no ho està.
@@ -53,6 +57,46 @@ El cicle complet d'un objectiu: 📋 planificar → vot del pla → 🔨 executa
 | `context_messages` | 30 | Missatges recents passats com a context (canviable en qualsevol moment; per a l'historial COMPLET els agents tenen `read_conversation`/`search_conversation`) |
 | `auto_summary` | off | Resum incremental en acabar cada sessió (1 crida extra) |
 | `max_round_seconds` | 0 | Durada màxima d'una ronda sencera |
+
+## Instal·lació nova: què cal activar {#installacio-nova-que-cal-activar}
+
+En una instal·lació nova (base de dades verge, p. ex. producció acabada d'instal·lar amb
+[`scripts/prod-install.ps1`](../scripts/prod-README.md)) la taula rodona **no es veu enlloc**
+encara que el codi hi sigui. No falta res: falta configuració, que viu a la BD i no viatja
+amb el paquet.
+
+**1. Activa els canals.** `ENABLE_CHANNELS` és `False` per defecte
+(`backend/open_webui/config.py`, ~línia 1984) i una BD nova agafa aquest valor.
+
+> Admin Panel → Settings → General → **Channels**
+
+Després refresca el navegador (Ctrl+Shift+R) i apareix **Channels** a la barra lateral.
+
+<details>
+<summary>Alternativa: directament a la BD (si no pots entrar a l'admin)</summary>
+
+La variable d'entorn `ENABLE_CHANNELS` només fixa el valor *inicial*; un cop la BD té la
+fila, mana la BD. Cal reiniciar el servidor després:
+
+```sql
+-- D:\open-webui-production\data\webui.db
+update config set value = 'true' where key = 'channels.enable';
+```
+</details>
+
+**2. Importa les pipes.** Sense elles la taula rodona no té agents amb qui parlar.
+
+> Admin Panel → Functions → Import
+
+Els fitxers són a [`integrations/`](../integrations/): `claude_cli_pipe.py`,
+`claude_agent_pipe.py`, `codex_pipe.py`. Recorda **activar-les** un cop importades.
+
+**3. Crea un canal** i segueix [Com s'usa](#com-susa-2-minuts).
+
+> **Per què no ve tot fet?** Models, pipes, canals i configuració són **dades** (taules
+> `model`, `function`, `channel`, `config`), no codi. Viuen a `webui.db` i per disseny el
+> wheel no en porta cap — per això actualitzar mai no et pot esborrar les converses. La
+> contrapartida és que una instal·lació nova comença buida i s'ha de configurar un cop.
 
 ## Variables d'entorn
 
