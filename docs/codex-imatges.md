@@ -60,18 +60,33 @@ Desactiva-la per tornar al comportament antic (xats en read-only, sense imatges)
 Només afecta els xats normals. Els torns de taula rodona amb carpeta-projecte mantenen
 el seu sandbox (`COLLAB_SANDBOX`) i no es toquen.
 
-## Sandbox de Windows sota AzureAD
+## Sandbox de Windows sota AzureAD (resolt)
 
-Als logs hi veuràs errors com:
+Aquesta màquina patia `CreateProcessAsUserW failed: 5 (Acceso denegado)` a cada comanda
+de Codex. Amb el flag `image_gen` no era fatal (Codex generava la imatge igualment via
+`node_repl`), però **a la taula rodona sí que ho era**: no podia ni llegir un fitxer del
+projecte, i els agents cedien el torn ronda rere ronda.
 
+La causa era `[windows] sandbox = "elevated"` a `~/.codex/config.toml`. Bug obert
+d'upstream: [#26896](https://github.com/openai/codex/issues/26896),
+[#10090](https://github.com/openai/codex/issues/10090),
+[#22880](https://github.com/openai/codex/issues/22880),
+[#19133](https://github.com/openai/codex/issues/19133).
+
+Solució aplicada (2026-07-16):
+
+```toml
+[windows]
+experimental_windows_sandbox = false
 ```
-CreateProcessAsUserW failed: 5 (Acceso denegado)
-```
 
-És el problema conegut d'aquesta màquina: el sandbox de Windows denega arrencar
-PowerShell. **No és fatal** — Codex genera la imatge igualment i fa servir `node_repl`
-per moure el fitxer. Bug obert a upstream:
-[openai/codex#19133](https://github.com/openai/codex/issues/19133) (afecta 0.120.0+).
+Verificat: Codex llegeix `orchestrator.py` (955 línies) en 3,6 s sense errors.
+
+**Què implica**: desactiva la capa de sandbox *de Windows*, no el control de Codex. Segueix
+manant el `-s` de `codex exec` — `read-only` als xats sense imatges, `workspace-write`
+limitat a la carpeta d'imatges, i `COLLAB_SANDBOX` (per defecte `danger-full-access`) als
+torns de taula rodona amb carpeta-projecte. Aquest últim sí que dona accés complet al disc:
+usa'l només amb carpetes de confiança.
 
 ## Desplegament
 

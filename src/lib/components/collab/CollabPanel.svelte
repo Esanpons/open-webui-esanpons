@@ -13,6 +13,7 @@
 		getCollabFileContent,
 		getCollabFiles,
 		getCollabTasks,
+		openCollabInVSCode,
 		retryCollabAgent,
 		startCollabRound,
 		stopCollabRound,
@@ -45,6 +46,21 @@
 		lastProjectDir = config.project_dir;
 		projectDirEdit = config.project_dir ?? '';
 	}
+
+	const openInVSCode = async () => {
+		if (!config?.project_dir) return;
+		try {
+			// El backend llança `code -n <carpeta>` → NOVA finestra de VS Code
+			// (a diferència del protocol vscode://, que reutilitza la finestra oberta).
+			await openCollabInVSCode(localStorage.token, channelId);
+			toast.success('Obrint una finestra nova de VS Code…');
+		} catch (e) {
+			// Fallback: protocol vscode:// (reutilitza finestra) si el CLI no hi és.
+			toast.message(`${e}`);
+			const path = config.project_dir.replace(/\\/g, '/');
+			window.location.href = `vscode://file/${encodeURI(path)}`;
+		}
+	};
 
 	const retryAgent = async (agentId: string) => {
 		try {
@@ -484,12 +500,28 @@
 						Sense carpeta. Els agents no tindran accés a fitxers.
 					</div>
 				{/if}
-				<button
-					class="px-3 py-1.5 rounded-lg text-xs bg-gray-200 dark:bg-gray-800 hover:bg-gray-300 dark:hover:bg-gray-700"
-					on:click={() => openBrowser(config.project_dir ?? null)}
-				>
-					📁 {config.project_dir ? 'Canvia la carpeta' : 'Tria una carpeta'}
-				</button>
+				<div class="flex gap-1.5">
+					<button
+						class="px-3 py-1.5 rounded-lg text-xs bg-gray-200 dark:bg-gray-800 hover:bg-gray-300 dark:hover:bg-gray-700"
+						on:click={() => openBrowser(config.project_dir ?? null)}
+					>
+						📁 {config.project_dir ? 'Canvia la carpeta' : 'Tria una carpeta'}
+					</button>
+					{#if config.project_dir}
+						<button
+							class="px-2.5 py-1.5 rounded-lg text-xs bg-gray-200 dark:bg-gray-800 hover:bg-gray-300 dark:hover:bg-gray-700 inline-flex items-center gap-1.5"
+							title="Obre la carpeta del projecte al VS Code"
+							on:click={openInVSCode}
+						>
+							<svg viewBox="0 0 24 24" class="size-3.5" fill="#007ACC" aria-hidden="true">
+								<path
+									d="M23.15 2.587L18.21.21a1.494 1.494 0 0 0-1.705.29l-9.46 8.63-4.12-3.128a.999.999 0 0 0-1.276.057L.327 7.261A1 1 0 0 0 .326 8.74L3.899 12 .326 15.26a1 1 0 0 0 .001 1.479L1.65 17.94a.999.999 0 0 0 1.276.057l4.12-3.128 9.46 8.63a1.492 1.492 0 0 0 1.704.29l4.942-2.377A1.5 1.5 0 0 0 24 20.06V3.939a1.5 1.5 0 0 0-.85-1.352zm-5.146 14.861L10.826 12l7.178-5.448v10.896z"
+								/>
+							</svg>
+							VS Code
+						</button>
+					{/if}
+				</div>
 
 				<div class="flex gap-1.5 mt-1.5">
 					<input

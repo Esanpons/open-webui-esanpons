@@ -108,3 +108,6 @@ export const retryCollabAgent = async (token: string, channelId: string, agentId
 		method: 'POST',
 		body: JSON.stringify({ agent_id: agentId })
 	});
+
+export const openCollabInVSCode = async (token: string, channelId: string) =>
+	request(token, `/${channelId}/open-vscode`, { method: 'POST' });

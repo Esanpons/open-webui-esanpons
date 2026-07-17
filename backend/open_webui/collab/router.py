@@ -6,7 +6,9 @@ Muntat a /api/v1/collab (vegeu el registre marcat # [collab-fork] a main.py).
 import asyncio
 import logging
 import os
+import shutil
 import string
+import subprocess
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -212,6 +214,40 @@ async def retry_agent(
         asyncio.create_task(run_round(request, channel, user))
         started = True
     return {"down_agents": await get_down_agents(channel.id), "started": started}
+
+
+@router.post("/{channel_id}/open-vscode")
+async def open_in_vscode(request: Request, channel_id: str, user=Depends(get_verified_user)):
+    """Obre la carpeta-projecte en una NOVA finestra de VS Code (`code -n`).
+
+    Només té sentit en desplegament LOCAL (el backend i el VS Code són a la
+    mateixa màquina), que és l'ús d'aquest fork. Requereix el CLI `code` al PATH."""
+    _check_can_manage(user)
+    channel = await _get_channel_checked(request, channel_id, user)
+    config = get_collab_config(channel)
+    if not config.project_dir or not os.path.isdir(config.project_dir):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Aquest espai no té carpeta-projecte")
+
+    code_bin = shutil.which("code") or shutil.which("code.cmd")
+    if not code_bin:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="No s'ha trobat el CLI `code` de VS Code al PATH del servidor.",
+        )
+
+    try:
+        # -n força una finestra NOVA (no reutilitza la que ja tinguis oberta).
+        # A Windows `code` és un .cmd; el resolem amb which i l'executem directament.
+        subprocess.Popen(
+            [code_bin, "-n", config.project_dir],
+            shell=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as e:
+        log.exception("No s'ha pogut obrir VS Code")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error obrint VS Code: {e}")
+
+    return {"opened": True, "path": config.project_dir}
 
 
 ############################
