@@ -7,8 +7,11 @@ eines de file_tools.py o via l'arbre injectat al context — mai depèn del
 client concret (Claude Code, Codex...).
 """
 
+import contextlib
 import logging
 import os
+import stat
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -34,7 +37,11 @@ IGNORED_DIRS = {
 
 MAX_TREE_ENTRIES = 400  # límit dur de l'arbre (prompt i API)
 MAX_SNAPSHOT_FILES = 20000  # límit del detector de canvis
-MAX_FILE_BYTES = 512 * 1024  # límit de lectura d'un fitxer (eines i API)
+MAX_FILE_BYTES = 512 * 1024  # límit de lectura/escriptura d'un fitxer (eines i API)
+
+# Prefix dels fitxers temporals d'escriptura atòmica (W4).
+_ATOMIC_TMP_PREFIX = ".collab_write_"
+_ATOMIC_TMP_SUFFIX = ".tmp"
 
 
 def resolve_safe(project_dir: str, relative: str = ".") -> Optional[Path]:
@@ -48,6 +55,24 @@ def resolve_safe(project_dir: str, relative: str = ".") -> Optional[Path]:
         return None
     except (OSError, ValueError):
         return None
+
+
+def escape_like(value: str | None) -> str:
+    """Escapa els comodins LIKE de SQL (``%``, ``_``) i el propi backslash.
+
+    W8-S6: prevenció. Quan es construeixi una consulta LIKE a partir d'entrada
+    d'usuari, els comodins ``%`` i ``_`` s'han d'escapar perquè no actuïn
+    com a wildcards. Aquesta funció retorna el text escapat llest per usar
+    amb ``LIKE :pattern ESCAPE '\\'``.
+
+    El backslash (``\\``) s'escapa primer perquè és el propi caràcter
+    d'escapament — si no, ``\\%`` es interpretaria com un ``%`` literal
+    seguit d'un comodí.
+    """
+    if not value:
+        return ""
+    # Escapar el backslash primer, després % i _.
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _iter_entries(root: Path):
@@ -124,18 +149,78 @@ def read_text_file(project_dir: str, relative: str, max_bytes: int = MAX_FILE_BY
 
 
 def write_text_file(project_dir: str, relative: str, content: str) -> tuple[bool, str]:
-    """Escriu (crea o sobreescriu) un fitxer de text dins del projecte."""
+    """Escriu (crea o sobreescriu) un fitxer de text dins del projecte.
+
+    W4-S2: Escriptura atòmica via tempfile + os.replace().
+    W4-S7: Límit de mida MAX_FILE_BYTES (igual que read_text_file).
+    """
     target = resolve_safe(project_dir, relative)
     if target is None:
         return False, f"Ruta fora del projecte: {relative}"
     if target.is_dir():
         return False, f"És una carpeta: {relative}"
+
+    # S7: límit de mida del contingut.
+    data = content.encode("utf-8")
+    if len(data) > MAX_FILE_BYTES:
+        return False, f"Contingut massa gran ({len(data)} bytes; màxim {MAX_FILE_BYTES})."
+
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        return True, f"Escrit {relative} ({len(content)} caràcters)."
+
+        # S2: escriure a un fitxer temporal al mateix directori del destí i
+        # llavors os.replace() (atómic tant a POSIX com a Windows).
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(target.parent),
+            prefix=_ATOMIC_TMP_PREFIX,
+            suffix=_ATOMIC_TMP_SUFFIX,
+        )
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            # Substituir un fitxer no ha de convertir-ne els permisos als
+            # restrictius per defecte de mkstemp.
+            if target.exists():
+                os.chmod(tmp_path, stat.S_IMODE(target.stat().st_mode))
+            os.replace(tmp_path, target)
+        except BaseException:
+            # Netejar el temporal si alguna cosa falla entre mkstemp i replace.
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp_path)
+            raise
+
+        return True, f"Escrit {relative} ({len(data)} bytes)."
     except OSError as e:
         return False, f"Error escrivint {relative}: {e}"
+
+
+def cleanup_temp_files(project_dir: str, *, min_age_seconds: int = 300) -> int:
+    """Elimina fitxers temporals orfes d'escriptures interrompudes.
+
+    W4-2: els fitxers .collab_write_*.tmp es queden si el procés mor
+    entre mkstemp i os.replace. Això els neteja periòdicament.
+    """
+    root = Path(project_dir)
+    count = 0
+    if not root.is_dir():
+        return 0
+    cutoff = time.time() - max(0, min_age_seconds)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith(".git")]
+        for f in filenames:
+            if f.startswith(_ATOMIC_TMP_PREFIX) and f.endswith(_ATOMIC_TMP_SUFFIX):
+                try:
+                    candidate = Path(dirpath) / f
+                    # Un temporal recent pot pertànyer a una escriptura viva.
+                    if candidate.stat().st_mtime > cutoff:
+                        continue
+                    candidate.unlink()
+                    count += 1
+                except (FileNotFoundError, OSError):
+                    pass
+    return count
 
 
 def snapshot(project_dir: str) -> dict[str, tuple[float, int]]:

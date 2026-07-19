@@ -4,6 +4,9 @@ Filosofia (vegeu docs/plans/espai-collaboratiu.md): cap agent director. Després
 de cada missatge es pregunta a cada agent si vol intervenir (hand-raising) i
 parlen per ordre de prioritat, un torn seqüencial cada vegada, fins que ningú
 vol afegir res (consens implícit) o un guardarail configurable atura la ronda.
+
+W7 refactor: torns → turns.py, prompts → prompts.py, context → context.py,
+agents_status → agents_status.py, voting → voting.py.
 """
 
 import asyncio
@@ -11,10 +14,27 @@ import json
 import logging
 import re
 import time
+import uuid
+from contextlib import suppress
 from typing import Optional
 
+from starlette.responses import Response, StreamingResponse
+
 from open_webui.collab.config import CollabConfig, get_collab_config
+from open_webui.collab.backpressure import acquire as acquire_model_slot
+from open_webui.collab.budget import _is_degraded, check_budget
+from open_webui.collab.circuit_breaker import can_proceed, record_failure, record_success
+from open_webui.collab.engine import (
+    acquire_lease,
+    list_events,
+    reconcile_expired_session,
+    record_user_message,
+    release_lease,
+    renew_lease,
+    transition_receipt,
+)
 from open_webui.collab.file_tools import COLLAB_TOOL_ID, ensure_collab_tool
+from open_webui.collab.profiles import get_channel_config, resolve_agent
 from open_webui.collab.files import (
     diff_snapshots,
     format_changes,
@@ -35,9 +55,51 @@ from open_webui.collab.tasks import (
     set_summary,
     tasks_as_text,
 )
+from open_webui.collab.usage import (
+    STATUS_SUCCESS,
+    classify_error,
+    estimate_tokens,
+    record_usage,
+)
+
+# W7 — mòduls extrets
+from open_webui.collab.turns import (
+    _HARD_TURN_TIMEOUT,
+    _effective_turn_timeout,
+    _mark_cancelled_message,
+    _turn_cancellables,
+    active_turn_id,
+    cancel_turn,
+    lock_turn_tool,
+    unlock_turn_tool,
+)
+from open_webui.collab.prompts import (
+    SYSTEM_AUTHOR,
+    _PHILOSOPHY,
+    _apply_agent_prompt,
+    _model_supports_effort,
+    _phase_block,
+)
+from open_webui.collab.context import (
+    _board_text,
+    _collab_ctx,
+    collab_generation_context,
+    _participants_line,
+    _project_block,
+    build_transcript,
+)
+from open_webui.collab.agents_status import (
+    _RETRY_DOWN_SECONDS,
+    extract_model_error,
+    _mark_agent_down,
+    _mark_agent_up,
+)
+from open_webui.collab.voting import _update_summary, _vote_on_proposal
+
 from open_webui.models.channels import ChannelModel, Channels
 from open_webui.models.messages import MessageForm, Messages
 from open_webui.models.users import Users
+from open_webui.socket.main import sio
 from open_webui.utils.channels import replace_mentions
 from open_webui.utils.models import get_all_models, get_filtered_models
 
@@ -47,12 +109,9 @@ log = logging.getLogger(__name__)
 # (Un sol worker; si mai es desplega multi-worker caldrà moure-ho a Redis.)
 _active_rounds: dict[str, dict] = {}
 
-SYSTEM_AUTHOR = {"model_id": "collab:system", "model_name": "🤝 Taula rodona"}
-
 _HANDRAISE_JSON_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
 _INTERVENE_RE = re.compile(r'"intervene"\s*:\s*(true|false)', re.IGNORECASE)
 _PRIORITY_RE = re.compile(r'"priority"\s*:\s*(\d+)')
-_AGREE_RE = re.compile(r'"agree"\s*:\s*(true|false)', re.IGNORECASE)
 
 # Marcadors de text per a les propostes de consens — funcionen amb QUALSEVOL
 # model, també els pipes CLI que no fan tool-calling (l'eina propose_finish és
@@ -61,101 +120,318 @@ _FINISH_MARKER_RE = re.compile(r"FEINA_ACABADA\s*:?\s*(.*)", re.DOTALL)
 _PLAN_MARKER_RE = re.compile(r"PLA_ACORDAT\s*:?\s*(.*)", re.DOTALL)
 _WAIT_USER_MARKER = "ESPEREM_USUARI"
 
-# Detecció d'agents caiguts (quota exhaurida, timeouts, errors del CLI).
-_ERROR_CONTENT_RE = re.compile(
-    r"\*\*(?:Claude|Codex)[^\n]{0,40}error|usage limit|rate.?limit|no ha retornat resposta",
-    re.IGNORECASE,
-)
-_RETRY_DOWN_SECONDS = 300  # reintent automàtic d'un agent caigut cada 5 min
 # Errors consecutius de mà alçada abans de declarar l'agent caigut (in-memory).
 _handraise_failures: dict[tuple[str, str], int] = {}
+_budget_notices: dict[str, str] = {}
+_models_without_collab_tools: set[str] = set()
 
-
-async def _mark_agent_down(request, channel, user, models: dict, agent_id: str, reason: str):
-    name = models.get(agent_id, {}).get("name", agent_id)
-    already_down = agent_id in await get_down_agents(channel.id)
-    await set_down_agent(channel.id, agent_id, reason)
-    if not already_down:
-        await post_notice(
-            request,
-            channel,
-            user,
-            f"🔻 **{name}** ha caigut ({reason}). L'equip ho ha de tenir en compte i "
-            "repartir-se la seva feina pendent. El sistema el reintentarà cada uns "
-            "minuts; també el pots reintentar des del panell 🤝 (botó 🔄).",
-        )
-
-
-async def _mark_agent_up(request, channel, user, models: dict, agent_id: str):
-    if await clear_down_agent(channel.id, agent_id):
-        name = models.get(agent_id, {}).get("name", agent_id)
-        await post_notice(
-            request, channel, user, f"🟢 **{name}** torna a estar operatiu i es reincorpora a l'equip."
-        )
-
-# Filosofia de treball de l'equip (vegeu docs/collab-workspace.md § Filosofia):
-# sense piràmide, funcions en lloc de rangs, submissió mútua, primer planificar.
-_PHILOSOPHY = (
-    "Filosofia de l'equip (IMPORTANT, regeix per sobre de tot):\n"
-    "- Sou un EQUIP UNIT, no assistents independents. Ningú està per sobre de "
-    "ningú: no hi ha caps ni jerarquia. Cadascú té una FUNCIÓ segons les seves "
-    "capacitats, no un rang.\n"
-    "- Sotmeteu-vos els uns als altres: escolta, demana opinió, accepta "
-    "correccions de bon grat. L'acord de l'equip val més que la iniciativa "
-    "individual.\n"
-    "- PRIMER es planifica EN EQUIP i DESPRÉS s'executa. Mai facis feina que "
-    "l'equip no hagi parlat i acordat.\n"
-    "- Coordinació: si la teva feina depèn de la d'un altre, ESPERA que estigui "
-    "feta (mira el tauler de tasques) i digues que esperes. Quan acabis una "
-    "cosa de la qual algú depèn, ANUNCIA-HO clarament perquè pugui continuar.\n"
-    "- L'usuari és un membre més de l'equip: si el pla preveu que validi o "
-    "decideixi alguna cosa, demaneu-l'hi explícitament i ESPEREU la seva "
-    "resposta abans d'executar aquella part. Si l'equip està esperant una "
-    "resposta de l'usuari i tu no tens res més a fer, respon NOMÉS amb la "
-    "línia `ESPEREM_USUARI:` i el motiu — mai tanquis la feina sense la "
-    "validació que el pla prometia.\n"
-    "- QUALITAT per sobre de velocitat: treballeu amb l'ambició d'un bon "
-    "professional i APROFITEU les capacitats reals de cada membre (si algú "
-    "pot generar imatges de debò, no en feu una d'ASCII; si algú pot executar "
-    "o provar codi, proveu-lo). No lliureu una versió mediocre per acabar abans."
+# Les crides auxiliars han de ser realment curtes. Sense max_tokens alguns
+# proveïdors reserven milers de tokens de sortida per un JSON de tres camps i
+# rebutgen la petició per TPM abans de començar a generar.
+_QUICK_TASK_MAX_TOKENS = {
+    # Els models de raonament compten els tokens interns dins el límit; 1024
+    # continua sent molt menys que els 7k–8k reservats abans, però evita tallar
+    # el JSON de Nemotron/GPT-OSS abans que acabi de raonar.
+    "handraise": 1024,
+    "vote": 1024,
+    "summary": 1200,
+}
+_RETRY_AFTER_RE = re.compile(
+    r"(?:please\s+try\s+again\s+in|retry\s+after)\s+([0-9]+(?:\.[0-9]+)?)\s*s",
+    re.IGNORECASE,
+)
+# El model no admet tool calling. Els proveïdors ho diuen de formes diferents
+# ("Error: `tool calling` is not supported", "`tool calling` is not supported
+# with this model", "does not support tools"...). No exigim prefix ni posició.
+_TOOL_CALLING_UNSUPPORTED_RE = re.compile(
+    r"`?tool[ _]?call(?:ing|s)?`?\s+(?:is|are)\s+not\s+supported"
+    r"|does\s+not\s+support\s+tool"
+    r"|no\s+support\s+for\s+tool",
+    re.IGNORECASE,
+)
+# L'error parla de mida/TOKENS (no de peticions): reintentar amb el mateix
+# prompt tornaria a fallar; cal reduir-lo. Cobreix les variants de Groq
+# ("Request Entity Too Large", codi `request_too_large`), OpenAI/OpenRouter
+# (TPM, context length) i altres proveïdors.
+_TOKEN_LIMIT_HINT_RE = re.compile(
+    r"tokens per minute|\bTPM\b|request[ _]?(?:entity[ _]?)?too[ _]?large"
+    r"|payload too large|\b413\b|prompt is too long"
+    r"|reduce the length|context.?(?:length|window)|input is too long",
+    re.IGNORECASE,
 )
 
 
-def _phase_block(phase: str) -> str:
-    if phase == "planning":
-        return (
-            "\n\nFASE ACTUAL: 📋 PLANIFICACIÓ — l'equip encara NO executa.\n"
-            "- NO toquis fitxers ni facis la feina encara.\n"
-            "- El que toca ara: entendre l'objectiu, fer preguntes, proposar "
-            "enfocaments, criticar-los amb arguments i consensuar QUÈ es farà i "
-            "COM us repartiu la feina (creeu tasques al tauler amb assignat, si "
-            "tens eines).\n"
-            "- NO proposis el pla al teu primer torn si cap altre membre encara "
-            "no ha opinat: primer escolta almenys una altra veu de l'equip.\n"
-            "- Quan creguis que el pla està complet i consensuat per tots, acaba "
-            "el teu missatge amb una línia que comenci EXACTAMENT per "
-            "`PLA_ACORDAT:` seguida del pla resumit (què farà cadascú). La resta "
-            "votarà; si hi ha consens, començareu a executar."
-        )
-    if phase == "execution":
-        return (
-            "\n\nFASE ACTUAL: 🔨 EXECUCIÓ — el pla ja està acordat; ara es treballa.\n"
-            "- Fes LA TEVA part del pla (marca la tasca 🔵 en començar i ✅ en "
-            "acabar, si tens eines) i explica què has fet.\n"
-            "- Revisa la feina dels altres quan toqui; si veus un problema, "
-            "digues-ho amb respecte i arguments.\n"
-            "- Si la teva part depèn d'una tasca d'un altre que encara no està "
-            "feta, digues que esperes i cedeix el torn.\n"
-            "- Quan acabis una cosa de la qual algú depenia, anuncia-ho.\n"
-            "- Quan TOT l'objectiu estigui complet i revisat, acaba amb "
-            "`FEINA_ACABADA:` i el resum final. La resta votarà."
-        )
-    # Mode lliure (require_planning desactivat)
-    return (
-        "\n\nMode lliure: planifiqueu i executeu amb seny, sempre parlant-ho "
-        "abans en equip. Quan TOT estigui complet i revisat, acaba amb "
-        "`FEINA_ACABADA:` i el resum final."
+def _retry_after_seconds(content: str | None) -> float | None:
+    """Retard curt sol·licitat pel proveïdor dins un error de rate-limit."""
+    if not content or "rate limit" not in content.lower():
+        return None
+    match = _RETRY_AFTER_RE.search(content)
+    if not match:
+        return None
+    return min(15.0, max(0.0, float(match.group(1))))
+
+
+async def _reset_response_for_retry(message_id: str) -> None:
+    """Reutilitza el placeholder del torn després d'una fallada recuperable."""
+    message = await Messages.get_message_by_id(message_id)
+    if not message:
+        return
+    await Messages.update_message_by_id(
+        message_id,
+        MessageForm(
+            content="",
+            data=message.data or {},
+            meta={**(message.meta or {}), "done": False},
+        ),
     )
+
+
+async def _resolved_agent(channel_id: str, agent_id: str) -> dict:
+    """Resol els overrides efectius; en absència de perfil conserva el comportament base."""
+    try:
+        channel_config = await get_channel_config(channel_id)
+        overrides = (channel_config or {}).get("agent_overrides") or []
+        return resolve_agent(agent_id, overrides)
+    except Exception:
+        log.exception("No s'han pogut resoldre els overrides de %s", agent_id)
+        return resolve_agent(agent_id, [])
+
+
+def _agent_display_name(resolved: dict, model: dict | None, agent_id: str) -> str:
+    """Nom a mostrar per un agent: display_name del override > nom del model > id."""
+    dn = resolved.get("display_name")
+    if dn:
+        return dn
+    if model:
+        return model.get("name", agent_id)
+    return agent_id
+
+
+async def _channel_budget(channel_id: str) -> dict | None:
+    try:
+        channel_config = await get_channel_config(channel_id)
+        return (channel_config or {}).get("budget")
+    except Exception:
+        log.exception("No s'ha pogut carregar el pressupost de %s", channel_id)
+        return None
+
+
+async def _circuit_allows(channel_id: str, agent_id: str) -> bool:
+    """El circuit protegeix el proveïdor, però una fallada d'estat no bloqueja torns."""
+    try:
+        return await can_proceed(channel_id, agent_id)
+    except Exception:
+        log.exception("No s'ha pogut consultar el circuit de %s", agent_id)
+        return True
+
+
+async def _record_circuit_result(
+    channel_id: str, agent_id: str, status: str
+) -> None:
+    try:
+        if status == STATUS_SUCCESS:
+            await record_success(channel_id, agent_id)
+        else:
+            await record_failure(channel_id, agent_id, status)
+    except Exception:
+        log.exception("No s'ha pogut actualitzar el circuit de %s", agent_id)
+
+
+async def _effective_collab_config(channel: ChannelModel) -> CollabConfig:
+    """Retorna la configuració canònica que consumeix el motor.
+
+    Aplicar o editar una plantilla ja sincronitza la seva configuració a
+    ``channel.meta.collab``.  ``collab_channel_config`` conserva la vinculació,
+    les personalitzacions dels agents i el pressupost, però una còpia antiga
+    d'aquest registre no pot desactivar una taula que el panell mostra activa.
+    """
+    return get_collab_config(channel)
+
+
+async def _budget_model_or_none(
+    request,
+    channel,
+    user,
+    agent_id: str,
+    call_type: str,
+    resolved: dict,
+) -> str | None:
+    decision = await check_budget(
+        channel.id, agent_id, call_type, await _channel_budget(channel.id)
+    )
+    if decision.allowed:
+        _budget_notices.pop(channel.id, None)
+        return agent_id
+    if decision.action == "downgrade" and resolved.get("fallback_model_id"):
+        return str(resolved["fallback_model_id"])
+    if decision.action == "stop":
+        request_stop(channel.id)
+    reason = decision.reason or "Pressupost exhaurit"
+    if _budget_notices.get(channel.id) != reason:
+        _budget_notices[channel.id] = reason
+        icon = "🛑" if decision.action == "stop" else "⏸️"
+        await post_notice(request, channel, user, f"{icon} {reason}.")
+    return None
+
+
+def _content_from_completion_payload(payload) -> str:
+    """Normalitza les formes habituals OpenAI/Responses/pipes a text."""
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices") or []
+    if choices:
+        choice = choices[0] or {}
+        content = (choice.get("message") or {}).get("content")
+        if content is None:
+            content = (choice.get("delta") or {}).get("content")
+        if isinstance(content, str):
+            return content
+    texts = []
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for part in item.get("content") or []:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+    if texts:
+        return "\n\n".join(texts)
+    for key in ("content", "response", "text"):
+        if isinstance(payload.get(key), str):
+            return payload[key]
+    return ""
+
+
+def _completion_error(payload, status_code: int | None = None) -> str | None:
+    if isinstance(payload, dict) and payload.get("error"):
+        error = payload["error"]
+        if isinstance(error, dict):
+            # OpenRouter (i altres agregadors) amaguen la causa real dins
+            # error.code i error.metadata (provider_name, raw); sense això el
+            # missatge queda en un "Provider returned error" inservible.
+            parts = [str(error.get("message", error.get("detail", error)))]
+            code = error.get("code") or error.get("status")
+            if code:
+                parts.append(f"[codi {code}]")
+            metadata = error.get("metadata")
+            if isinstance(metadata, dict):
+                provider = metadata.get("provider_name")
+                if provider:
+                    parts.append(f"[proveïdor: {provider}]")
+                raw = metadata.get("raw")
+                if raw:
+                    parts.append(str(raw)[:300])
+            return " ".join(parts)
+        return str(error)
+    if status_code is not None and status_code >= 400:
+        return f"Provider returned HTTP {status_code}"
+    return None
+
+
+def _decode_completion_bytes(raw: bytes | str) -> tuple[str, dict | None]:
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text.strip(), None
+    return _content_from_completion_payload(payload), payload if isinstance(payload, dict) else None
+
+
+async def _normalize_completion_response(response) -> tuple[str, dict]:
+    """Retorna ``(content, payload)`` per dict, Response i SSE/NDJSON.
+
+    Alguns pipes retornen JSONResponse o PlainTextResponse encara que el
+    caller hagi demanat JSON. Les crides col·laboratives no poden assumir
+    subscripció ``response['choices']``.
+    """
+    if isinstance(response, dict):
+        error = _completion_error(response)
+        if error:
+            raise RuntimeError(error)
+        return _content_from_completion_payload(response), response
+    if isinstance(response, StreamingResponse):
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else str(chunk))
+        content_parts = []
+        last_payload = {}
+        for line in "".join(chunks).splitlines():
+            part = line.removeprefix("data:").strip()
+            if not part or part == "[DONE]":
+                continue
+            content, payload = _decode_completion_bytes(part)
+            if payload:
+                last_payload = payload
+                error = _completion_error(payload, response.status_code)
+                if error:
+                    raise RuntimeError(error)
+            if content:
+                content_parts.append(content)
+        return "".join(content_parts), last_payload
+    if isinstance(response, Response):
+        content, payload = _decode_completion_bytes(response.body)
+        error = _completion_error(payload, response.status_code)
+        if error:
+            raise RuntimeError(error)
+        return content, payload or {}
+    raise TypeError(f"Unsupported completion response: {type(response).__name__}")
+
+
+async def _run_generation_until_done(request, form_data, user, message_id: str):
+    response = await request.app.state.CHAT_COMPLETION_HANDLER(request, form_data, user=user)
+    # Cridat fora d'una ruta ASGI, ningú consumeix automàticament el body d'un
+    # StreamingResponse. Consumir-lo és el que executa el pipeline, emet els
+    # deltes i marca el missatge del canal com a acabat.
+    direct_content = ""
+    if isinstance(response, StreamingResponse):
+        direct_content, _ = await _normalize_completion_response(response)
+    elif isinstance(response, (dict, Response)):
+        direct_content, _ = await _normalize_completion_response(response)
+    message = await Messages.get_message_by_id(message_id)
+    if message and not (message.meta or {}).get("done") and direct_content.strip():
+        await Messages.update_message_by_id(
+            message_id,
+            MessageForm(
+                content=direct_content,
+                data=message.data or {},
+                meta={**(message.meta or {}), "done": True},
+            ),
+        )
+    while True:
+        message = await Messages.get_message_by_id(message_id)
+        if not message or (message.meta or {}).get("done"):
+            persisted = message.content if message else None
+            return persisted if persisted and persisted.strip() else (direct_content or persisted)
+        await asyncio.sleep(1.5)
+
+
+async def _record_usage_safely(
+    channel_id: str, agent_id: str, call_type: str, *, model_id: str | None = None, **kwargs
+):
+    """La telemetria mai ha de fer fallar una conversa."""
+    try:
+        if model_id and "estimated_cost" not in kwargs:
+            from open_webui.collab.budget import estimate_cost
+
+            kwargs["estimated_cost"] = estimate_cost(
+                model_id, kwargs.get("input_tokens"), kwargs.get("output_tokens")
+            )
+        await record_usage(channel_id, agent_id, call_type, **kwargs)
+    except Exception:
+        log.warning(
+            "No s'ha pogut registrar telemetria %s per %s al canal %s",
+            call_type,
+            agent_id,
+            channel_id,
+            exc_info=True,
+        )
+
+
+def _response_usage(response: dict) -> tuple[int | None, int | None]:
+    """Extreu usage OpenAI-compatible; si no hi és, el caller farà estimació."""
+    usage = response.get("usage") or {}
+    input_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
+    output_tokens = usage.get("completion_tokens", usage.get("output_tokens"))
+    return input_tokens, output_tokens
 
 
 async def _current_phase(channel_id: str, config: CollabConfig) -> str:
@@ -205,7 +481,8 @@ async def handle_collab_message(request, channel, message, user) -> bool:
                 user,
                 "🤝 Espai col·laboratiu activat automàticament — l'equip es posa en marxa.",
             )
-            await run_round(request, channel, user)
+            event_seq = await _persist_user_message(channel.id, message, config.agents)
+            await run_round(request, channel, user, event_seq=event_seq)
             return True
 
     if not (config.enabled and config.agents):
@@ -215,8 +492,138 @@ async def handle_collab_message(request, channel, message, user) -> bool:
         # Missatge generat per un agent: ja el veu la ronda en curs.
         return True
 
-    await run_round(request, channel, user)
+    event_seq = await _persist_user_message(channel.id, message, config.agents)
+    await run_round(request, channel, user, event_seq=event_seq)
     return True
+
+
+async def _persist_user_message(channel_id: str, message, agents: list[str]):
+    """Registra l'entrada humana i els receipts abans d'engegar la ronda.
+
+    Les dues escriptures comparteixen una transacció interna a ``engine`` per
+    garantir ordre monotònic; la creació de receipts és idempotent.
+    """
+    message_id = str(message.id) if getattr(message, "id", None) is not None else None
+    event = await record_user_message(
+        channel_id,
+        agents,
+        message_id=message_id,
+        payload={"content_length": len(message.content or "")},
+    )
+    await _emit_collab_event(event)
+    return event.seq
+
+
+async def _latest_user_event_seq(channel_id: str, since: int) -> tuple[int | None, int]:
+    """Retorna l'última entrada humana i el cursor escanejat.
+
+    Es pagina per no perdre una entrada encara que entre torns s'hagin generat
+    més de 1.000 events. El scheduler continu només ho consulta als límits
+    segurs entre torns.
+    """
+    cursor = since
+    latest = None
+    while True:
+        events = await list_events(channel_id, since=cursor, limit=1000)
+        if not events:
+            break
+        for event in events:
+            cursor = max(cursor, event.seq)
+            if event.type == "user_message":
+                latest = event.seq
+        if len(events) < 1000:
+            break
+    return latest, cursor
+
+
+async def _emit_collab_event(event):
+    """Publica un event persistent al mateix room socket que els missatges."""
+    try:
+        await sio.emit(
+            "events:channel",
+            {
+                "channel_id": event.channel_id,
+                "message_id": event.message_id,
+                "data": {
+                    "type": "collab_event.v1",
+                    "data": {
+                        "seq": event.seq,
+                        "event": {
+                            "type": event.type,
+                            "agent_id": event.agent_id,
+                            "message_id": event.message_id,
+                            "payload": event.payload or {},
+                            "status": event.status,
+                            "timestamp": event.created_at,
+                        },
+                    },
+                },
+            },
+            to=f"channel:{event.channel_id}",
+        )
+    except Exception:
+        log.warning(
+            "No s'ha pogut emetre l'event collab %s/%s",
+            event.channel_id,
+            event.seq,
+            exc_info=True,
+        )
+
+
+async def _transition_receipt(channel_id: str, event_seq: int, agent_id: str, state: str):
+    event, _summary = await transition_receipt(
+        channel_id, event_seq, agent_id, state
+    )
+    if event is not None:
+        await _emit_collab_event(event)
+
+
+async def _emit_turn_event(
+    channel_id: str, event_type: str, agent_id: str, message_id: str | None, payload: dict
+):
+    """Event persistent de cicle de torn (turn_started/turn_finished) per a la
+    barra d'agents (W1: estat «speaking»). Mai ha de fer fallar un torn."""
+    try:
+        from open_webui.collab.engine import append_event
+
+        event = await append_event(
+            channel_id,
+            event_type,
+            agent_id=agent_id,
+            message_id=message_id,
+            payload=payload,
+        )
+        await _emit_collab_event(event)
+    except Exception:
+        log.warning(
+            "No s'ha pogut emetre l'event %s de %s al canal %s",
+            event_type,
+            agent_id,
+            channel_id,
+            exc_info=True,
+        )
+
+
+async def _renew_round_lease(channel_id: str, owner: str, state: dict):
+    """Manté el lease viu; si es perd, demana una sortida neta de la ronda."""
+    while not state["stop"]:
+        await asyncio.sleep(10)
+        if not await renew_lease(channel_id, owner):
+            log.error("S'ha perdut el lease persistent del canal %s", channel_id)
+            state["lease_lost"] = True
+            state["stop"] = True
+            # Un altre worker pot agafar el canal ara mateix: tallar el torn en
+            # curs evita dos torns simultanis sobre el mateix canal/projecte.
+            with suppress(Exception):
+                await cancel_turn(channel_id, reason="lease_lost")
+            return
+
+
+async def reconcile_channel(channel_id: str) -> bool:
+    """Recupera una sessió persistent abandonada després d'una caiguda."""
+    if channel_id in _active_rounds:
+        return False
+    return await reconcile_expired_session(channel_id)
 
 
 async def post_notice(request, channel, user, content: str):
@@ -242,94 +649,6 @@ async def _get_models(request, user) -> dict:
     }
 
 
-async def build_transcript(channel_id: str, config: CollabConfig, models: dict) -> str:
-    """Transcripció recent del canal amb autors etiquetats (D4), en ordre
-    cronològic. S'ometen les comandes /collab i els placeholders buits de
-    torns en curs."""
-    limit = int(config.guardrail("context_messages") or 30)
-    messages = (await Messages.get_messages_by_channel_id(channel_id, 0, limit))[::-1]
-
-    user_ids = list({m.user_id for m in messages})
-    users = {u.id: u for u in await Users.get_users_by_user_ids(user_ids)}
-
-    lines = []
-    for m in messages:
-        content = (m.content or "").strip()
-        meta = m.meta or {}
-        if content.lower().startswith("/collab"):
-            continue
-        if meta.get("model_id") and not meta.get("done"):
-            continue  # torn encara en curs (placeholder "treballant")
-        if meta.get("model_id") and not content:
-            continue  # torn acabat sense text
-        if meta.get("model_id"):
-            author = meta.get("model_name") or models.get(meta["model_id"], {}).get(
-                "name", meta["model_id"]
-            )
-        else:
-            author_user = users.get(m.user_id)
-            author = author_user.name if author_user else "Usuari"
-        lines.append(f"[{author}]: {replace_mentions(content)}")
-
-    return "\n\n".join(lines)
-
-
-def _participants_line(config: CollabConfig, models: dict, exclude: Optional[str] = None) -> str:
-    names = []
-    for agent_id in config.agents:
-        if agent_id == exclude:
-            continue
-        names.append(models.get(agent_id, {}).get("name", agent_id))
-    return ", ".join(names) if names else "(cap altre agent)"
-
-
-def _project_block(config: CollabConfig, include_tree: bool = False) -> str:
-    if not config.project_dir:
-        return ""
-    text = (
-        f"\n\nCarpeta del projecte compartit: {config.project_dir}\n"
-        "Per treballar-hi tens les eines del sistema (independents del model): "
-        "`list_project_files()`, `read_project_file(path)` i "
-        "`write_project_file(path, content)`. Els agents amb accés directe al "
-        "disc (Claude Code, Codex) també la tenen com a directori de treball. "
-        "Els altres agents hi treballen alhora: revisa què han canviat abans de "
-        "trepitjar-los la feina."
-    )
-    if include_tree:
-        text += (
-            "\n\nEstat actual de la carpeta (arbre de fitxers):\n"
-            + tree_as_text(config.project_dir)
-        )
-    return text
-
-
-def _collab_ctx(channel: ChannelModel, config: CollabConfig) -> dict:
-    return {
-        "channel_id": channel.id,
-        "project_dir": config.project_dir,
-        "agents": config.agents,
-    }
-
-
-async def _board_text(channel_id: str) -> str:
-    """Resum incremental + tauler de tasques + agents caiguts, per al context."""
-    parts = []
-    summary = await get_summary(channel_id)
-    if summary:
-        parts.append("Resum de la feina fins ara (mantingut pel sistema):\n" + summary)
-    tasks = await get_tasks(channel_id)
-    if tasks:
-        parts.append("Tauler de tasques de l'equip:\n" + tasks_as_text(tasks))
-    down = await get_down_agents(channel_id)
-    if down:
-        fallen = ", ".join(f"{agent_id} ({info.get('reason', 'error')})" for agent_id, info in down.items())
-        parts.append(
-            f"⚠️ AGENTS CAIGUTS ara mateix: {fallen}. No compteu amb ells fins que "
-            "es recuperin: repartiu-vos la seva feina pendent i no els assigneu res de nou."
-        )
-    return ("\n\n" + "\n\n".join(parts)) if parts else ""
-
-
 async def _quick_completion(
     request, user, channel, config: CollabConfig, agent_id: str, system: str, prompt: str, task: str
 ) -> Optional[str]:
@@ -337,8 +656,20 @@ async def _quick_completion(
     contingut de la resposta o None si falla o supera el handraise_timeout."""
     from open_webui.utils.chat import generate_chat_completion
 
+    if not await _circuit_allows(channel.id, agent_id):
+        log.info("Circuit obert: s'omet la crida %s de %s", task, agent_id)
+        return None
+    resolved = await _resolved_agent(channel.id, agent_id)
+    effective_model_id = await _budget_model_or_none(
+        request, channel, user, agent_id, task, resolved
+    )
+    if effective_model_id is None:
+        return None
+    resolved_name = _agent_display_name(resolved, None, agent_id)
+    system = _apply_agent_prompt(system, resolved, resolved_name)
+    turn_id = str(uuid.uuid4())
     form_data = {
-        "model": agent_id,
+        "model": effective_model_id,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
@@ -346,29 +677,101 @@ async def _quick_completion(
         "stream": False,
         "metadata": {"collab": {**_collab_ctx(channel, config), "task": task}},
     }
+    if resolved.get("token_limit"):
+        form_data["max_tokens"] = int(resolved["token_limit"])
+    elif task in _QUICK_TASK_MAX_TOKENS:
+        form_data["max_tokens"] = _QUICK_TASK_MAX_TOKENS[task]
 
     timeout = int(config.guardrail("handraise_timeout") or 0)
-    try:
-        coroutine = generate_chat_completion(request, form_data, user, bypass_filter=True)
-        response = await (asyncio.wait_for(coroutine, timeout) if timeout else coroutine)
-        return response["choices"][0]["message"]["content"] or ""
-    except asyncio.TimeoutError:
-        log.warning("Crida %s de %s ha superat el timeout (%ss)", task, agent_id, timeout)
-        return None
-    except Exception:
-        log.exception("Crida %s de %s ha fallat", task, agent_id)
-        return None
+    estimated_input = estimate_tokens(system) + estimate_tokens(prompt)
+    for attempt in range(2):
+        try:
+            async with acquire_model_slot(effective_model_id):
+                coroutine = generate_chat_completion(
+                    request, form_data, user, bypass_filter=True
+                )
+                response = await (
+                    asyncio.wait_for(coroutine, timeout) if timeout else coroutine
+                )
+            content, payload = await _normalize_completion_response(response)
+            input_tokens, output_tokens = _response_usage(payload)
+            status, detail = (STATUS_SUCCESS, None) if content else classify_error("")
+            await _record_usage_safely(
+                channel.id,
+                agent_id,
+                task,
+                model_id=effective_model_id,
+                input_tokens=input_tokens if input_tokens is not None else estimated_input,
+                output_tokens=(
+                    output_tokens if output_tokens is not None else estimate_tokens(content)
+                ),
+                status=status,
+                error_detail=detail,
+            )
+            await _record_circuit_result(channel.id, agent_id, status)
+            return content
+        except asyncio.TimeoutError as exc:
+            log.warning(
+                "Crida %s de %s ha superat el timeout (%ss)", task, agent_id, timeout
+            )
+            status, detail = classify_error(exc)
+            await _record_usage_safely(
+                channel.id,
+                agent_id,
+                task,
+                model_id=effective_model_id,
+                input_tokens=estimated_input,
+                status=status,
+                error_detail=detail,
+            )
+            await _record_circuit_result(channel.id, agent_id, status)
+            return None
+        except Exception as exc:
+            status, detail = classify_error(exc)
+            await _record_usage_safely(
+                channel.id,
+                agent_id,
+                task,
+                model_id=effective_model_id,
+                input_tokens=estimated_input,
+                status=status,
+                error_detail=detail,
+            )
+            retry_delay = _retry_after_seconds(str(exc))
+            if attempt == 0 and retry_delay is not None:
+                log.warning(
+                    "Rate-limit transitori a la crida %s de %s; reintent en %.2fs",
+                    task,
+                    agent_id,
+                    retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+            log.exception("Crida %s de %s ha fallat", task, agent_id)
+            await _record_circuit_result(channel.id, agent_id, status)
+            return None
+
+    return None
 
 
 async def _handraise_one(
-    request, user, channel, config: CollabConfig, models: dict, agent_id: str, transcript: str, board: str, phase: str
+    request,
+    user,
+    channel,
+    config: CollabConfig,
+    models: dict,
+    agent_id: str,
+    transcript: str,
+    board: str,
+    phase: str,
 ) -> tuple[str, Optional[dict]]:
     """Pregunta a un agent si vol intervenir. Retorna (estat, dades):
     ('yes', {'agent','priority','reason'}) | ('no', None) | ('error', None)."""
     model = models.get(agent_id)
     if not model:
         return ("error", None)
-    name = model.get("name", agent_id)
+    resolved = await _resolved_agent(channel.id, agent_id)
+    name = _agent_display_name(resolved, model, agent_id)
 
     system = (
         f"Ets {name}, membre d'un equip d'IAs que treballa unit en una taula "
@@ -390,8 +793,11 @@ async def _handraise_one(
     prompt = (
         "Transcripció recent de la taula rodona:\n\n"
         f"{transcript}\n\n"
-        f"{question} NO intervinguis per cortesia ni per repetir el que ja "
-        "s'ha dit. Respon NOMÉS amb aquest JSON, sense res més:\n"
+        f"{question} Si el missatge més recent de l'usuari s'adreça directament "
+        "a tu o demana que respongueu TOTS (per exemple: saludeu, presenteu-vos, "
+        "opineu tots), marca `intervene: true`: és una petició explícita, no "
+        "simple cortesia. No intervinguis per fer-te passar per un altre agent "
+        "ni per repetir el que ja s'ha dit. Respon NOMÉS amb aquest JSON, sense res més:\n"
         '{"intervene": true|false, "priority": 1-5, "reason": "màxim una frase"}'
     )
 
@@ -418,16 +824,48 @@ async def _handraise_one(
             priority = int(priority_match.group(1)) if priority_match else 3
     if not intervene:
         return ("no", None)
-    return ("yes", {"agent": agent_id, "priority": max(1, min(5, priority)), "reason": reason})
+    return (
+        "yes",
+        {
+            "agent": agent_id,
+            "priority": max(1, min(5, priority)),
+            "profile_priority": int(resolved.get("priority") or 3),
+            "reason": reason,
+        },
+    )
 
 
 async def handraise(
-    request, channel, config: CollabConfig, user, models: dict, last_speaker: Optional[str]
+    request,
+    channel,
+    config: CollabConfig,
+    user,
+    models: dict,
+    last_speaker: Optional[str],
+    event_seq: int | None = None,
 ) -> tuple[list[str], int, int]:
     """Ronda de mà alçada. Retorna (voluntaris per ordre de prioritat,
     quants han pogut respondre, quants s'han consultat) — així es distingeix
     el consens ("ningú vol parlar") d'una fallada de tots els agents."""
-    transcript = await build_transcript(channel.id, config, models)
+    budget = await _channel_budget(channel.id)
+    degraded = await _is_degraded(channel.id, budget)
+    context_config = config
+    handraise_context = int(config.guardrail("handraise_context_messages") or 0)
+    general_context = int(config.guardrail("context_messages") or 30)
+    if degraded:
+        context_config = config.model_copy(
+            update={"guardrails": {**config.guardrails, "context_messages": 5}}
+        )
+    elif handraise_context:
+        context_config = config.model_copy(
+            update={
+                "guardrails": {
+                    **config.guardrails,
+                    "context_messages": min(general_context, handraise_context),
+                }
+            }
+        )
+    transcript = await build_transcript(channel.id, context_config, models)
     board = await _board_text(channel.id)
     phase = await _current_phase(channel.id, config)
 
@@ -443,9 +881,26 @@ async def handraise(
     if not config.guardrail("allow_self_reply") and last_speaker in candidates and len(candidates) > 1:
         candidates.remove(last_speaker)
 
+    if event_seq is not None:
+        skipped = [agent_id for agent_id in config.agents if agent_id not in candidates]
+        for agent_id in skipped:
+            await _transition_receipt(channel.id, event_seq, agent_id, "pass")
+        for agent_id in candidates:
+            await _transition_receipt(channel.id, event_seq, agent_id, "evaluating")
+
     results = await asyncio.gather(
         *[
-            _handraise_one(request, user, channel, config, models, agent_id, transcript, board, phase)
+            _handraise_one(
+                request,
+                user,
+                channel,
+                config,
+                models,
+                agent_id,
+                transcript,
+                board,
+                phase,
+            )
             for agent_id in candidates
         ]
     )
@@ -453,6 +908,13 @@ async def handraise(
     # Comptabilitat de caiguts: 2 errors seguits de mà alçada → caigut; una
     # resposta vàlida → recuperat.
     for agent_id, (status, _payload) in zip(candidates, results):
+        if event_seq is not None:
+            await _transition_receipt(
+                channel.id,
+                event_seq,
+                agent_id,
+                "will_intervene" if status == "yes" else "pass",
+            )
         key = (channel.id, agent_id)
         if status == "error":
             _handraise_failures[key] = _handraise_failures.get(key, 0) + 1
@@ -470,89 +932,14 @@ async def handraise(
     volunteers = [payload for status, payload in results if status == "yes"]
     responded = sum(1 for status, _payload in results if status != "error")
     order = {agent_id: idx for idx, agent_id in enumerate(config.agents)}
-    volunteers.sort(key=lambda v: (-v["priority"], order.get(v["agent"], 99)))
+    volunteers.sort(
+        key=lambda v: (
+            -v["priority"],
+            -v.get("profile_priority", 3),
+            order.get(v["agent"], 99),
+        )
+    )
     return [v["agent"] for v in volunteers], responded, len(candidates)
-
-
-async def _vote_on_proposal(
-    request, channel, config: CollabConfig, user, models: dict, proposal: dict
-) -> tuple[bool, int, int]:
-    """Vot de consens sobre una proposta de tancament. Retorna
-    (consens, a_favor, en_contra). El proposant no vota; si és l'únic agent,
-    consens automàtic. Empat o cap vot vàlid = NO consens (la feina continua)."""
-    proposer = proposal.get("by", "")
-    summary = proposal.get("summary", "")
-    kind = proposal.get("kind", "finish")
-    down = await get_down_agents(channel.id)
-    voters = [
-        a for a in config.agents if models.get(a, {}).get("name", a) != proposer and a not in down
-    ]
-    if not voters:
-        return True, 0, 0
-
-    transcript = await build_transcript(channel.id, config, models)
-    board = await _board_text(channel.id)
-
-    async def vote_one(agent_id: str) -> Optional[bool]:
-        name = models.get(agent_id, {}).get("name", agent_id)
-        system = (
-            f"Ets {name}, membre d'un equip d'IAs que treballa unit per assolir "
-            "l'objectiu comú.\n\n" + _PHILOSOPHY + _project_block(config) + board
-        )
-        if kind == "plan":
-            ask = (
-                f"{proposer} proposa donar el PLA de l'equip per ACORDAT:\n{summary}\n\n"
-                "És un pla prou clar i complet (què es farà i qui fa què) per començar "
-                "a executar? Si falta parlar res important, vota en contra."
-            )
-        else:
-            ask = (
-                f"{proposer} proposa donar la feina de l'equip per ACABADA amb aquest resum:\n"
-                f"{summary}\n\n"
-                "Està realment complet l'objectiu? Sigues MOLT exigent: vota en contra si "
-                "falta res, si el resultat és bàsic o mediocre, si milloraria clarament "
-                "aprofitant les capacitats d'algun membre (imatges reals, proves, etc.), o "
-                "si el pla prometia una validació de l'usuari que encara no ha arribat."
-            )
-        prompt = (
-            "Transcripció recent de la taula rodona:\n\n"
-            f"{transcript}\n\n"
-            f"{ask} Respon NOMÉS amb aquest JSON:\n"
-            '{"agree": true|false, "reason": "màxim una frase"}'
-        )
-        content = await _quick_completion(request, user, channel, config, agent_id, system, prompt, "vote")
-        if content is None:
-            return None
-        match = _AGREE_RE.search(content)
-        return match.group(1).lower() == "true" if match else None
-
-    votes = await asyncio.gather(*[vote_one(a) for a in voters])
-    agrees = sum(1 for v in votes if v is True)
-    disagrees = sum(1 for v in votes if v is False)
-    return (agrees > disagrees), agrees, disagrees
-
-
-async def _update_summary(request, channel, config: CollabConfig, user, models: dict):
-    """Resum incremental de l'espai (Fase 4): un agent fa de secretari en
-    acabar la ronda i el resum es guarda a channel.meta['collab_summary']."""
-    agent_id = next((a for a in config.agents if a in models), None)
-    if not agent_id:
-        return
-    previous = await get_summary(channel.id)
-    transcript = await build_transcript(channel.id, config, models)
-    system = (
-        "Ets el secretari d'una taula rodona d'IAs. Mantens un resum viu de "
-        "l'estat de la feina de l'equip: objectiu, decisions preses, què està "
-        "fet i què queda pendent."
-    )
-    prompt = (
-        (f"Resum anterior:\n{previous}\n\n" if previous else "")
-        + f"Conversa recent:\n\n{transcript}\n\n"
-        "Retorna NOMÉS el resum actualitzat (màxim 250 paraules), sense preàmbuls."
-    )
-    content = await _quick_completion(request, user, channel, config, agent_id, system, prompt, "summary")
-    if content:
-        await set_summary(channel.id, content.strip())
 
 
 def _next_agent(agents: list[str], last_speaker: Optional[str]) -> str:
@@ -578,8 +965,27 @@ async def agent_turn(
         )
         return None
 
-    name = model.get("name", agent_id)
-    transcript = await build_transcript(channel.id, config, models)
+    if not await _circuit_allows(channel.id, agent_id):
+        await post_notice(
+            request, channel, user, f"⚡ L'agent `{agent_id}` està temporalment en pausa (circuit obert)."
+        )
+        return None
+
+    resolved = await _resolved_agent(channel.id, agent_id)
+    name = _agent_display_name(resolved, model, agent_id)
+    effective_model_id = await _budget_model_or_none(
+        request, channel, user, agent_id, "turn", resolved
+    )
+    if effective_model_id is None:
+        return None
+    effective_model = models.get(effective_model_id, model)
+    degraded = await _is_degraded(channel.id, await _channel_budget(channel.id))
+    context_config = config
+    if degraded:
+        context_config = config.model_copy(
+            update={"guardrails": {**config.guardrails, "context_messages": 5}}
+        )
+    transcript = await build_transcript(channel.id, context_config, models)
     board = await _board_text(channel.id)
     phase = await _current_phase(channel.id, config)
 
@@ -597,45 +1003,55 @@ async def agent_turn(
         None,
     )
 
-    system = (
-        f"Ets {name}, membre d'un EQUIP d'IAs que treballa unit en una taula rodona, "
-        f"juntament amb: {_participants_line(config, models, exclude=agent_id)} i les "
-        "persones usuàries.\n\n"
-        + _PHILOSOPHY
-        + "\n\nRegles pràctiques:\n"
-        "- Adreça't als altres pel seu nom quan els responguis.\n"
-        "- Sigues concret; no repeteixis el que ja s'ha dit ni facis resums de cortesia.\n"
-        "- Tauler d'equip (si tens tools): `list_tasks()`, `create_task(title, assignee)`, "
-        "`update_task(task_id, status|assignee|notes)`. Manteniu-lo al dia.\n"
-        "- Aquí sota veus només els missatges recents, però TOTA la conversa queda "
-        "guardada: si necessites revisar tot el que s'ha fet o buscar una decisió "
-        "antiga (o l'usuari t'ho demana), usa `read_conversation(offset, limit)` o "
-        "`search_conversation(query)`."
-        + _phase_block(phase)
-        + _project_block(config, include_tree=True)
-        + board
-    )
-    prompt = (
-        "Transcripció recent de la taula rodona (autors entre claudàtors):\n\n"
-        f"{transcript}\n\n"
-        f"És el teu torn, {name}. Continua la conversa."
-    )
-    if nudge:
-        prompt += f"\n\n[Avís del sistema: {nudge}]"
-
-    form_data = {
-        "model": agent_id,
-        "messages": [
+    def _compose_messages(transcript_text: str, include_tree: bool) -> list[dict]:
+        system = (
+            f"Ets {name}, membre d'un EQUIP d'IAs que treballa unit en una taula rodona, "
+            f"juntament amb: {_participants_line(config, models, exclude=agent_id)} i les "
+            "persones usuàries.\n\n"
+            + _PHILOSOPHY
+            + "\n\nRegles pràctiques:\n"
+            "- Adreça't als altres pel seu nom quan els responguis.\n"
+            "- Sigues concret; no repeteixis el que ja s'ha dit ni facis resums de cortesia.\n"
+            "- Tauler d'equip (si tens tools): `list_tasks()`, `create_task(title, assignee)`, "
+            "`update_task(task_id, status|assignee|notes)`. Manteniu-lo al dia.\n"
+            "- Aquí sota veus només els missatges recents, però TOTA la conversa queda "
+            "guardada: si necessites revisar tot el que s'ha fet o buscar una decisió "
+            "antiga (o l'usuari t'ho demana), usa `read_conversation(offset, limit)` o "
+            "`search_conversation(query)`."
+            + _phase_block(phase)
+            + _project_block(config, include_tree=include_tree)
+            + board
+        )
+        system = _apply_agent_prompt(system, resolved, name)
+        prompt = (
+            "Transcripció recent de la taula rodona (autors entre claudàtors):\n\n"
+            f"{transcript_text}\n\n"
+            f"És el teu torn, {name}. Continua la conversa."
+        )
+        if nudge:
+            prompt += f"\n\n[Avís del sistema: {nudge}]"
+        return [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
-        ],
+        ]
+
+    messages = _compose_messages(transcript, include_tree=not degraded)
+    estimated_input = sum(estimate_tokens(m["content"]) for m in messages)
+
+    turn_id = str(uuid.uuid4())
+    form_data = {
+        "model": effective_model_id,
+        "messages": messages,
         "stream": True,
         "chat_id": f"channel:{channel.id}",
         "id": response_message.id,
         "session_id": f"channel:{channel.id}",
         "background_tasks": {},
-        # Arriba a les eines i als pipes com a __metadata__['variables']['collab'].
-        "variables": {"collab": _collab_ctx(channel, config)},
+        # Les eines llegeixen variables.collab, però els models tipus pipe
+        # construeixen __metadata__ des de form_data.metadata. Cal enviar el
+        # mateix context pels dos camins perquè Codex/Claude respectin els
+        # guardrails del canal (especialment turn_timeout).
+        **collab_generation_context(channel, config, turn_id),
     }
 
     # Gestió de fitxers i tauler EXTERNS als models: eines estàndard
@@ -643,42 +1059,176 @@ async def agent_turn(
     # qualsevol model (Ollama, APIs, pipes...) hi tingui accés. També fem
     # foto de la carpeta per detectar canvis.
     files_before = None
-    if await ensure_collab_tool(user.id):
+    if (
+        effective_model_id not in _models_without_collab_tools
+        and await ensure_collab_tool(user.id)
+    ):
         form_data["tool_ids"] = [COLLAB_TOOL_ID]
+    if resolved.get("tools") is not None:
+        allowed_tools = set(resolved["tools"])
+        form_data["tool_ids"] = [
+            tool_id for tool_id in form_data.get("tool_ids", []) if tool_id in allowed_tools
+        ]
+    if resolved.get("token_limit"):
+        form_data["max_tokens"] = int(resolved["token_limit"])
+    if resolved.get("effort") and _model_supports_effort(effective_model):
+        form_data["reasoning_effort"] = resolved["effort"]
     if config.project_dir:
         files_before = snapshot(config.project_dir)
 
+    async def _run_with_backpressure():
+        async with acquire_model_slot(effective_model_id):
+            content = await _run_generation_until_done(
+                request, form_data, user, response_message.id
+            )
+            retry_delay = _retry_after_seconds(content)
+            has_tools = bool(form_data.get("tool_ids"))
+            tools_unsupported = bool(
+                has_tools and content and _TOOL_CALLING_UNSUPPORTED_RE.search(content)
+            )
+            # Alguns models (p. ex. Gemini) responen amb una tool-call silenciosa
+            # i deixen el text final BUIT quan se'ls adjunten eines i la tasca no
+            # en necessita cap (saludar, opinar...). Un torn buit amb eines es
+            # reintenta un cop SENSE eines abans de donar-lo per caigut.
+            empty_with_tools = has_tools and not (content or "").strip()
+            if retry_delay is None and not tools_unsupported and not empty_with_tools:
+                return content
+
+            retry_status, retry_detail = classify_error(content)
+            await _record_usage_safely(
+                channel.id,
+                agent_id,
+                "turn",
+                model_id=effective_model_id,
+                input_tokens=estimated_input,
+                output_tokens=estimate_tokens(content),
+                status=retry_status,
+                error_detail=retry_detail,
+            )
+            await _record_circuit_result(channel.id, agent_id, retry_status)
+
+            retry_form = dict(form_data)
+            if tools_unsupported:
+                _models_without_collab_tools.add(effective_model_id)
+                retry_form.pop("tool_ids", None)
+                log.warning(
+                    "El model %s no admet tool calling; es repeteix el torn sense eines",
+                    effective_model_id,
+                )
+            elif empty_with_tools:
+                # No el memoritzem com a "sense eines" (pot funcionar en un torn
+                # que sí requereixi fitxers); només aquest torn va sense eines.
+                retry_form.pop("tool_ids", None)
+                await _reset_response_for_retry(response_message.id)
+                log.warning(
+                    "Torn buit amb eines de %s; es repeteix sense eines", effective_model_id
+                )
+                return await _run_generation_until_done(
+                    request, retry_form, user, response_message.id
+                )
+            else:
+                # Si el límit és de TOKENS (TPM, prompt massa gran...), repetir
+                # la mateixa petició tornaria a petar: es reconstrueix el prompt
+                # en mode lleuger (5 missatges de context, sense arbre) perquè
+                # càpiga dins la finestra del proveïdor.
+                if _TOKEN_LIMIT_HINT_RE.search(content or ""):
+                    try:
+                        lean_config = config.model_copy(
+                            update={"guardrails": {**config.guardrails, "context_messages": 5}}
+                        )
+                        lean_transcript = await build_transcript(channel.id, lean_config, models)
+                        retry_form["messages"] = _compose_messages(
+                            lean_transcript, include_tree=False
+                        )
+                        log.warning(
+                            "Reintent en mode lleuger (menys context) per límit de tokens de %s",
+                            effective_model_id,
+                        )
+                    except Exception:
+                        log.exception("No s'ha pogut construir el prompt lleuger; reintent normal")
+                log.warning(
+                    "Rate-limit transitori de %s; es repeteix el torn en %.2fs",
+                    effective_model_id,
+                    retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+
+            await _reset_response_for_retry(response_message.id)
+            return await _run_generation_until_done(
+                request, retry_form, user, response_message.id
+            )
+
+    # W1: estat «speaking» visible en temps real a la barra d'agents.
+    await _emit_turn_event(
+        channel.id,
+        "turn_started",
+        agent_id,
+        response_message.id,
+        {"name": name, "model_id": effective_model_id},
+    )
+
+    generation_task = asyncio.create_task(_run_with_backpressure())
+    _turn_cancellables[turn_id] = {
+        "channel_id": channel.id,
+        "agent_id": agent_id,
+        "message_id": response_message.id,
+        "task": generation_task,
+        "started_at": time.time(),
+        "cancel_reason": None,
+        "cancel_pending": False,
+        "tool_lock_depth": 0,
+        "active_tool": None,
+    }
+    final_content: Optional[str] = None
+    turn_timed_out = False
     try:
-        await request.app.state.CHAT_COMPLETION_HANDLER(request, form_data, user=user)
-    except Exception:
+        final_content = await asyncio.wait_for(
+            generation_task, timeout=_effective_turn_timeout(config)
+        )
+    except asyncio.TimeoutError as exc:
+        turn_timed_out = True
+        _turn_cancellables[turn_id]["cancel_reason"] = "timeout"
+        await _mark_cancelled_message(response_message.id, "timeout")
+        log.warning("Torn de %s tallat pel timeout efectiu", agent_id)
+        await post_notice(
+            request, channel, user, f"⏱️ Torn de {name} cancel·lat per timeout."
+        )
+    except asyncio.CancelledError:
+        reason = _turn_cancellables.get(turn_id, {}).get("cancel_reason") or "cancelled"
+        await _mark_cancelled_message(response_message.id, reason)
+        await post_notice(
+            request, channel, user, f"✖ Torn de {name} cancel·lat ({reason})."
+        )
+        return None
+    except Exception as exc:
         log.exception("El torn de %s ha fallat en llançar-se", agent_id)
+        status, detail = classify_error(exc)
+        await _record_usage_safely(
+            channel.id,
+            agent_id,
+            "turn",
+            model_id=effective_model_id,
+            input_tokens=estimated_input,
+            status=status,
+            error_detail=detail,
+        )
+        await _record_circuit_result(channel.id, agent_id, status)
         await post_notice(
             request,
             channel,
             user,
-            f"⚠️ El torn de {name} ha fallat en llançar-se; continuo la ronda. (Detall als logs.)",
+            f"⚠️ El torn de {name} ha fallat: {exc}. Continuo la ronda.",
         )
         return None
-
-    timeout = int(config.guardrail("turn_timeout") or 0)
-    start = time.time()
-    final_content: Optional[str] = None
-    while True:
-        message = await Messages.get_message_by_id(response_message.id)
-        if not message or (message.meta or {}).get("done"):
-            final_content = message.content if message else None
-            break
-        if timeout and (time.time() - start) > timeout:
-            log.warning("Torn de %s tallat per turn_timeout (%ss)", agent_id, timeout)
-            await post_notice(
-                request,
-                channel,
-                user,
-                f"⚠️ El torn de {name} ha superat el `turn_timeout` ({timeout}s); continuo la ronda.",
-            )
-            final_content = message.content if message else None
-            break
-        await asyncio.sleep(1.5)
+    finally:
+        _turn_cancellables.pop(turn_id, None)
+        await _emit_turn_event(
+            channel.id,
+            "turn_finished",
+            agent_id,
+            response_message.id,
+            {"name": name},
+        )
 
     # Detecció de canvis al projecte (externa als models): foto abans/després
     # del torn i avís 🗂️ al canal amb els fitxers tocats.
@@ -693,17 +1243,47 @@ async def agent_turn(
 
     # Detecció d'agent caigut (quota exhaurida, timeout, error del CLI) i
     # recuperació si el torn ha anat bé.
+    content_error = extract_model_error(final_content)
     failure_reason = None
     if final_content is None:
         failure_reason = "el torn no s'ha pogut executar"
     elif not final_content.strip():
         failure_reason = "torn sense cap resposta (possible límit de quota o penjada)"
-    elif _ERROR_CONTENT_RE.search(final_content):
-        failure_reason = "error del model (possible límit de quota)"
+
+    if turn_timed_out:
+        usage_status, usage_detail = classify_error(asyncio.TimeoutError("turn_timeout"))
+    elif final_content is None or not final_content.strip():
+        usage_status, usage_detail = classify_error(final_content)
+    elif content_error:
+        usage_status, usage_detail = classify_error(content_error)
+    else:
+        usage_status, usage_detail = STATUS_SUCCESS, None
+
+    if content_error:
+        failure_reason = {
+            "quota_exceeded": "límit de quota o rate-limit confirmat pel model",
+            "timeout": "timeout del model",
+            "context_too_large": "context massa gran",
+            "empty_response": "torn sense resposta",
+            "cli_error": "error del CLI",
+            "provider_error": "error del proveïdor",
+        }.get(usage_status, "error del model")
+    await _record_usage_safely(
+        channel.id,
+        agent_id,
+        "turn",
+        model_id=effective_model_id,
+        input_tokens=estimated_input,
+        output_tokens=estimate_tokens(final_content),
+        status=usage_status,
+        error_detail=usage_detail,
+    )
 
     if failure_reason:
+        await _record_circuit_result(channel.id, agent_id, usage_status)
         await _mark_agent_down(request, channel, user, models, agent_id, failure_reason)
     else:
+        await _record_circuit_result(channel.id, agent_id, STATUS_SUCCESS)
         await _mark_agent_up(request, channel, user, models, agent_id)
 
     # Propostes de consens via marcadors de text (funcionen amb tots els
@@ -724,7 +1304,7 @@ async def agent_turn(
     return final_content
 
 
-async def run_round(request, channel, user):
+async def run_round(request, channel, user, *, event_seq: int | None = None):
     """Bucle principal d'una ronda: torns seqüencials fins a silenci, stop o
     guardarail. Recarrega la config a cada volta perquè els canvis en calent
     (/collab guardrails, agents...) tinguin efecte immediat."""
@@ -733,15 +1313,25 @@ async def run_round(request, channel, user):
         # proper hand-raising automàticament.
         return
 
-    state = {"stop": False}
+    lease_owner = f"round-{uuid.uuid4()}"
+    if not await acquire_lease(channel.id, lease_owner):
+        # Un altre worker ja processa aquest canal. El missatge humà ja ha
+        # quedat persistit i el scheduler propietari el podrà recollir.
+        return
+
+    state = {"stop": False, "lease_lost": False}
     _active_rounds[channel.id] = state
+    lease_task = asyncio.create_task(_renew_round_lease(channel.id, lease_owner, state))
     try:
         turns = 0
         quick_calls = 0
         stall_nudges = 0  # empentes anti-silenci consecutives sense voluntaris
+        temp_cleanup_done = False  # W4-2: neteja de .collab_write_*.tmp orfes
         started = time.time()
         last_speaker: Optional[str] = None
         roundrobin_queue: Optional[list[str]] = None
+        pending_event_seq = event_seq
+        scheduler_event_cursor = event_seq or 0
         config = None
         models: dict = {}
 
@@ -752,12 +1342,42 @@ async def run_round(request, channel, user):
             fresh_channel = await Channels.get_channel_by_id(channel.id)
             if not fresh_channel:
                 break
-            config = get_collab_config(fresh_channel)
+            config = await _effective_collab_config(fresh_channel)
             if not (config.enabled and config.agents):
                 break
             if state["stop"]:
-                await post_notice(request, channel, user, "⏹️ Equip aturat.")
+                if not state["lease_lost"]:
+                    await post_notice(request, channel, user, "⏹️ Equip aturat.")
                 break
+
+            # W4-2: una vegada per ronda, neteja els temporals orfes que hagin
+            # quedat d'escriptures atòmiques interrompudes (crash a mig torn).
+            if config.project_dir and not temp_cleanup_done:
+                temp_cleanup_done = True
+                try:
+                    from open_webui.collab.files import cleanup_temp_files
+
+                    removed = await asyncio.to_thread(cleanup_temp_files, config.project_dir)
+                    if removed:
+                        log.info(
+                            "Netejats %d temporals orfes de %s", removed, config.project_dir
+                        )
+                except Exception:
+                    log.exception("No s'han pogut netejar els temporals de %s", channel.id)
+
+            # Els receipts d'un missatge humà arribat a mitja ronda s'han de
+            # resoldre en qualsevol mode (W9); la preempció (reconstruir la cua
+            # i reactivar les empentes) és exclusiva del mode continuous.
+            latest_user_seq, scheduler_event_cursor = await _latest_user_event_seq(
+                channel.id, scheduler_event_cursor
+            )
+            if latest_user_seq is not None:
+                pending_event_seq = latest_user_seq
+                if config.conversation_mode == "continuous":
+                    # Una cua round-robin anterior ja no representa el context
+                    # vigent; es reconstrueix per al missatge humà nou.
+                    roundrobin_queue = None
+                    stall_nudges = 0
 
             max_turns = int(config.guardrail("max_agent_turns") or 0)
             if max_turns and turns >= max_turns:
@@ -788,14 +1408,30 @@ async def run_round(request, channel, user):
                 if roundrobin_queue is None:
                     roundrobin_queue = list(config.agents)
                 if not roundrobin_queue:
+                    pending_event_seq = None
                     break  # una passada per tots els agents i s'acaba
                 speaker = roundrobin_queue.pop(0)
                 if speaker in await get_down_agents(channel.id):
+                    if pending_event_seq is not None:
+                        await _transition_receipt(
+                            channel.id, pending_event_seq, speaker, "pass"
+                        )
                     continue  # agent caigut: se salta el seu torn
+                if pending_event_seq is not None:
+                    await _transition_receipt(
+                        channel.id, pending_event_seq, speaker, "will_intervene"
+                    )
             else:
                 volunteers, responded, asked = await handraise(
-                    request, channel, config, user, models, last_speaker
+                    request,
+                    channel,
+                    config,
+                    user,
+                    models,
+                    last_speaker,
+                    pending_event_seq,
                 )
+                pending_event_seq = None
                 quick_calls += asked
                 if state["stop"]:
                     continue
@@ -953,3 +1589,14 @@ async def run_round(request, channel, user):
         log.exception("La ronda del canal %s ha petat", channel.id)
     finally:
         _active_rounds.pop(channel.id, None)
+        lease_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await lease_task
+        try:
+            await release_lease(
+                channel.id,
+                lease_owner,
+                stopped=state["stop"] and not state["lease_lost"],
+            )
+        except Exception:
+            log.exception("No s'ha pogut alliberar el lease del canal %s", channel.id)

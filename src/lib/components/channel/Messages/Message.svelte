@@ -39,11 +39,13 @@
 	import ArrowUpLeftAlt from '$lib/components/icons/ArrowUpLeftAlt.svelte';
 	import PinSlash from '$lib/components/icons/PinSlash.svelte';
 	import Pin from '$lib/components/icons/Pin.svelte';
+	import type { CollabAgentIdentity } from '$lib/apis/collab';
 
 	export let className = '';
 
 	export let message;
 	export let channel;
+	export let collabIdentities: Record<string, CollabAgentIdentity> = {};
 
 	export let showUserProfile = true;
 	export let thread = false;
@@ -71,6 +73,19 @@
 			? `${id}-${message.reply_to_message.id}`
 			: message.reply_to_message.id
 		: null;
+	$: modelId = message?.meta?.model_id ?? null;
+	$: isCollabSystem = modelId === 'collab:system';
+	$: collabIdentity = modelId ? collabIdentities[modelId] : null;
+	$: isCollabAgent = !!collabIdentity && !isCollabSystem;
+	$: displayName = isCollabSystem
+		? 'Activitat de l’equip'
+		: (collabIdentity?.name ?? message?.meta?.model_name ?? modelId ?? message?.user?.name);
+	$: technicalError =
+		message?.meta?.error_detail ??
+		message?.meta?.technical_error ??
+		message?.data?.error_detail ??
+		message?.data?.technical_error ??
+		null;
 
 	// Swipe-to-reply state
 	let swipeStartX = 0;
@@ -185,9 +200,13 @@
 
 		<div
 			id="message-{renderedMessageId}"
-			class="flex flex-col justify-between w-full max-w-full mx-auto group hover:bg-gray-300/5 dark:hover:bg-gray-700/5 relative {className
+			class="flex flex-col justify-between w-full max-w-full mx-auto group relative {isCollabAgent
+				? 'my-1.5 rounded-2xl border bg-white/80 shadow-sm hover:shadow-md dark:bg-gray-900/70 dark:border-gray-800'
+				: isCollabSystem
+					? 'my-0.5 rounded-xl bg-gray-50/80 dark:bg-gray-900/50'
+					: 'hover:bg-gray-300/5 dark:hover:bg-gray-700/5'} {className
 				? className
-				: `px-5 ${
+				: `${isCollabAgent ? 'mx-3 sm:mx-5 px-3 sm:px-4 py-2' : 'px-5'} ${
 						replyToMessage
 							? 'border-l-4 border-blue-500 bg-blue-100/10 dark:bg-blue-100/5 pl-4'
 							: ''
@@ -199,7 +218,9 @@
 					} ${message?.is_pinned ? 'bg-yellow-100/20 dark:bg-yellow-100/5' : ''}`} {showUserProfile
 				? 'pt-1.5 pb-0.5'
 				: ''}"
-			style="transform: translateX({swipeOffsetX}px); {swipeOffsetX > 0
+			style="transform: translateX({swipeOffsetX}px); {isCollabAgent && collabIdentity?.color
+				? `border-left: 4px solid ${collabIdentity.color};`
+				: ''} {swipeOffsetX > 0
 				? ''
 				: 'transition: transform 0.3s cubic-bezier(0.2, 0.9, 0.3, 1);'}"
 		>
@@ -375,7 +396,18 @@
 			>
 				<div class={`shrink-0 mr-1 w-9`}>
 					{#if showUserProfile}
-						{#if message?.meta?.model_id}
+						{#if isCollabSystem}
+							<div
+								class="size-8 translate-y-1 ml-0.5 rounded-full grid place-items-center bg-gray-100 text-sm dark:bg-gray-800"
+								aria-hidden="true"
+							>⚙️</div>
+						{:else if isCollabAgent}
+							<div
+								class="size-8 translate-y-1 ml-0.5 rounded-full grid place-items-center text-base border bg-white dark:bg-gray-900"
+								style={`border-color: ${collabIdentity?.color ?? '#64748b'}`}
+								aria-label={`Avatar de ${displayName}`}
+							>{collabIdentity?.avatar ?? '🤖'}</div>
+						{:else if message?.meta?.model_id}
 							<img
 								src={`${WEBUI_API_BASE_URL}/models/model/profile/image?id=${message.meta.model_id}`}
 								alt={message.meta.model_name ?? message.meta.model_id}
@@ -417,11 +449,22 @@
 						<Name>
 							<div class=" self-end text-base shrink-0 font-medium truncate">
 								{#if message?.meta?.model_id}
-									{message?.meta?.model_name ?? message?.meta?.model_id}
+									{displayName}
 								{:else}
 									{message?.user?.name}
 								{/if}
 							</div>
+							{#if isCollabAgent && collabIdentity?.role}
+								<span
+									class="self-center max-w-40 truncate rounded-full px-2 py-0.5 text-[11px] font-medium bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+									title={collabIdentity.role}
+								>{collabIdentity.role}</span>
+							{/if}
+							{#if isCollabAgent && message?.meta?.model_name && message.meta.model_name !== displayName}
+								<span class="hidden sm:inline self-center truncate text-[10px] text-gray-400" title={modelId}
+									>{message.meta.model_name}</span
+								>
+							{/if}
 
 							{#if message.created_at}
 								<div
@@ -525,7 +568,13 @@
 							</div>
 						</div>
 					{:else}
-						<div class=" min-w-full markdown-prose {pending ? 'opacity-50' : ''}">
+						<div
+							class="min-w-full markdown-prose {isCollabSystem
+								? 'text-sm text-gray-600 dark:text-gray-300'
+								: ''} {pending ? 'opacity-50' : ''}"
+							role={isCollabSystem ? 'status' : undefined}
+							aria-live={isCollabSystem ? 'polite' : undefined}
+						>
 							{#if (message?.content ?? '').trim() === '' && message?.meta?.model_id}
 								<Skeleton />
 							{:else}
@@ -539,6 +588,15 @@
 									>{/if}
 							{/if}
 						</div>
+
+						{#if technicalError}
+							<details
+								class="mt-2 rounded-lg border border-red-200/70 bg-red-50/70 px-3 py-1.5 text-xs text-red-800 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200"
+							>
+								<summary class="cursor-pointer select-none font-medium">Detall tècnic</summary>
+								<pre class="mt-1.5 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono">{technicalError}</pre>
+							</details>
+						{/if}
 
 						{#if (message?.reactions ?? []).length > 0}
 							<div>

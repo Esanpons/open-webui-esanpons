@@ -229,6 +229,65 @@ def _split_tool_calls(
     return expanded
 
 
+def _parse_unwrapped_tool_call(content: str, available_tools: dict) -> Optional[dict]:
+    """Recover a tool call emitted as a bare JSON object.
+
+    Some local models advertise native tool support but occasionally omit the
+    wrapper expected by their chat template (for example, Qwen may omit its
+    ``<tool_call>`` tags).  Only accept a whole-response JSON object whose name
+    matches an actually available tool.  The allow-list check is important: a
+    normal assistant response containing arbitrary JSON must remain plain text.
+    """
+    if not isinstance(content, str) or not isinstance(available_tools, dict):
+        return None
+
+    raw = content.strip()
+
+    # Models that miss the wrapper often also fence the JSON in a markdown
+    # code block (```json ... ```); unwrap it before parsing.
+    if raw.startswith('```'):
+        lines = raw.split('\n')
+        if len(lines) >= 3 and lines[-1].strip() == '```':
+            raw = '\n'.join(lines[1:-1]).strip()
+
+    if not raw.startswith('{') or not raw.endswith('}'):
+        return None
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(payload, dict) or set(payload) != {'name', 'arguments'}:
+        return None
+
+    name = payload.get('name')
+    arguments = payload.get('arguments')
+    if not isinstance(name, str) or name not in available_tools:
+        return None
+
+    if isinstance(arguments, str):
+        try:
+            parsed_arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed_arguments, dict):
+            return None
+        arguments = parsed_arguments
+    elif not isinstance(arguments, dict):
+        return None
+
+    return {
+        'id': f'call_{uuid4().hex[:24]}',
+        'index': 0,
+        'type': 'function',
+        'function': {
+            'name': name,
+            'arguments': json.dumps(arguments),
+        },
+    }
+
+
 def get_citation_source_from_tool_result(
     tool_name: str, tool_params: dict, tool_result: str, tool_id: str = ''
 ) -> list[dict]:
@@ -3860,6 +3919,11 @@ async def streaming_chat_response_handler(response, ctx):
             message = await Chats.get_message_by_id_and_message_id(metadata['chat_id'], metadata['message_id'])
 
             tool_calls = []
+            # Call ids recovered from bare-JSON responses via
+            # _parse_unwrapped_tool_call — their follow-up requests must omit
+            # `tools` (models that need the fallback answer with JSON noise
+            # instead of text when the tool specs are resent).
+            recovered_tool_call_ids = set()
 
             last_assistant_message = None
             try:
@@ -4572,6 +4636,23 @@ async def streaming_chat_response_handler(response, ctx):
                                 )
                                 reasoning_item['status'] = 'completed'
 
+                    # Compatibility fallback for local models that emit the
+                    # function payload as bare JSON instead of using their
+                    # advertised native tool-call wrapper.  Only the last,
+                    # otherwise-empty assistant response is considered and the
+                    # function name must be present in this request's tool map.
+                    if not response_tool_calls and output and output[-1].get('type') == 'message':
+                        message_parts = output[-1].get('content', [])
+                        if len(message_parts) == 1 and message_parts[0].get('type') == 'output_text':
+                            recovered_tool_call = _parse_unwrapped_tool_call(
+                                message_parts[0].get('text', ''), metadata.get('tools', {})
+                            )
+                            if recovered_tool_call:
+                                response_tool_calls.append(recovered_tool_call)
+                                recovered_tool_call_ids.add(recovered_tool_call['id'])
+                                output.pop()
+                                content = ''
+
                     if response_tool_calls:
                         tool_calls.append(_split_tool_calls(response_tool_calls))
 
@@ -4935,6 +5016,9 @@ async def streaming_chat_response_handler(response, ctx):
                             'metadata': metadata,
                         }
 
+                        if any(tc.get('id') in recovered_tool_call_ids for tc in response_tool_calls):
+                            new_form_data.pop('tools', None)
+
                         if ENABLE_RESPONSES_API_STATEFUL and last_response_id:
                             system_message = get_system_message(form_data['messages'])
                             new_form_data['messages'] = (
@@ -5013,7 +5097,7 @@ async def streaming_chat_response_handler(response, ctx):
                         else:
                             break
                     except Exception as e:
-                        log.debug(e)
+                        log.exception(f'Error in tool-call follow-up completion: {e}')
                         break
 
                 if (

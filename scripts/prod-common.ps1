@@ -145,6 +145,44 @@ function Invoke-FrontendAndWheelBuild {
 # INSTAL-LACIO
 # ---------------------------------------------------------------------------
 
+function Stop-OpenWebUI {
+    # A Windows, pip no pot substituir de manera fiable un paquet que esta en us.
+    # Si produccio segueix arrencada, el force-reinstall pot deixar open_webui a
+    # mig desinstal-lar (directoris temporals amb prefix "~") i el seguent
+    # arrencada falla. Aturem nomes els executables que viuen dins APP_DIR.
+    $targets = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.ExecutablePath -and
+            ($_.ExecutablePath -ieq $PROD_EXE -or $_.ExecutablePath -ieq $PROD_PY)
+        }
+
+    if (-not $targets) {
+        Write-Ok 'produccio ja estava aturada'
+        return
+    }
+
+    Write-Step 'Aturant Open WebUI abans de substituir el paquet'
+    foreach ($process in ($targets | Sort-Object ProcessId -Descending)) {
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
+    $deadline = (Get-Date).AddSeconds(15)
+    do {
+        Start-Sleep -Milliseconds 250
+        $stillRunning = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.ExecutablePath -and
+                ($_.ExecutablePath -ieq $PROD_EXE -or $_.ExecutablePath -ieq $PROD_PY)
+            }
+    } while ($stillRunning -and (Get-Date) -lt $deadline)
+
+    if ($stillRunning) {
+        Stop-WithError 'No he pogut aturar completament Open WebUI. Tanca la finestra de produccio i torna-ho a provar.'
+    }
+
+    Write-Ok 'produccio aturada; el paquet ja es pot substituir amb seguretat'
+}
+
 function Install-Wheel {
     param([string]$WheelPath)
 

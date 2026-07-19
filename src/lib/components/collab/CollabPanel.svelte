@@ -1,10 +1,12 @@
 <script lang="ts">
 	// [collab-fork] Panell de l'espai col·laboratiu (taula rodona d'IAs).
 	// Config de l'espai + selector de carpeta-projecte + arbre de fitxers.
-	import { onDestroy, onMount } from 'svelte';
+	import { onMount } from 'svelte';
 	import { toast } from 'svelte-sonner';
 
 	import { models, socket } from '$lib/stores';
+	import CollabProfiles from './CollabProfiles.svelte';
+	import CollabSection from './CollabSection.svelte';
 	import {
 		browseCollabDirs,
 		createCollabTask,
@@ -15,6 +17,7 @@
 		getCollabTasks,
 		openCollabInVSCode,
 		retryCollabAgent,
+		cancelCollabTurn,
 		startCollabRound,
 		stopCollabRound,
 		updateCollabConfig,
@@ -25,6 +28,12 @@
 
 	export let channelId: string;
 	export let onClose: () => void = () => {};
+
+	// W6 (a11y): mou el focus al diàleg quan s'obre, perquè Esc i el teclat
+	// funcionin sense haver de clicar-hi primer.
+	const focusOnMount = (node: HTMLElement) => {
+		node.focus();
+	};
 
 	let config: CollabConfig | null = null;
 	let loading = true;
@@ -38,7 +47,6 @@
 	let browsePath: string | null = null;
 	let browseParent: string | null = null;
 	let browseDirs: { name: string; path: string }[] = [];
-	let manualPath = '';
 	// ruta actual editable (se sincronitza quan canvia al servidor, no a cada poll)
 	let projectDirEdit = '';
 	let lastProjectDir: string | null | undefined = undefined;
@@ -84,7 +92,7 @@
 		},
 		allow_self_reply: {
 			label: 'Auto-resposta',
-			help: "Permet que un agent torni a parlar just després del seu propi missatge (dos torns seguits). Normalment desactivat perquè no monopolitzi la conversa."
+			help: 'Permet que un agent torni a parlar just després del seu propi missatge (dos torns seguits). Normalment desactivat perquè no monopolitzi la conversa.'
 		},
 		turn_timeout: {
 			label: 'Timeout de torn (s)',
@@ -97,6 +105,10 @@
 		context_messages: {
 			label: 'Missatges de context',
 			help: 'Quants missatges recents del canal es passen a cada agent com a context de la conversa.'
+		},
+		handraise_context_messages: {
+			label: 'Context mà alçada',
+			help: 'Missatges recents usats només per decidir si un agent vol intervenir. Un valor petit redueix latència i límits TPM dels models gratuïts. 0 = reutilitzar tot el context general.'
 		},
 		require_planning: {
 			label: 'Planificació primer',
@@ -128,8 +140,41 @@
 
 	let pollInterval: ReturnType<typeof setInterval> | null = null;
 	let refreshTimeout: ReturnType<typeof setTimeout> | null = null;
+	const CONFIG_RESYNC_MS = 60_000;
 
 	const modelName = (id: string) => $models.find((m) => m.id === id)?.name ?? id;
+
+	// Etiqueta de la connexió d'on surt cada model (Groq, OpenRouter, Nvidia…):
+	// per convenció del fork, l'id porta el nom de la connexió davant del model
+	// real («Groq.openai/gpt-oss-120b»). Els d'Ollama es reconeixen per owned_by.
+	const connectionOf = (model: { id?: string; owned_by?: string }) => {
+		if (model?.owned_by === 'ollama') return 'Ollama';
+		const id = model?.id ?? '';
+		const dot = id.indexOf('.');
+		if (dot > 0 && id.slice(dot + 1).includes('/')) return id.slice(0, dot);
+		return '';
+	};
+	const modelLabel = (model: { id?: string; name?: string; owned_by?: string }) => {
+		const conn = connectionOf(model);
+		return conn ? `${conn} · ${model.name ?? model.id}` : (model.name ?? model.id ?? '');
+	};
+
+	// Mode de conversa unificat (un sol selector): combina mode + conversation_mode.
+	$: unifiedMode =
+		config?.mode === 'roundrobin'
+			? 'torns'
+			: (config?.conversation_mode ?? 'continuous') === 'continuous'
+				? 'lliure'
+				: 'rondes';
+	const setUnifiedMode = async (value: string) => {
+		if (value === 'torns') {
+			await save({ mode: 'roundrobin', conversation_mode: 'rounds' });
+		} else if (value === 'rondes') {
+			await save({ mode: 'handraise', conversation_mode: 'rounds' });
+		} else {
+			await save({ mode: 'handraise', conversation_mode: 'continuous' });
+		}
+	};
 
 	const loadConfig = async () => {
 		try {
@@ -201,10 +246,19 @@
 	const save = async (partial: Partial<CollabConfig>) => {
 		saving = true;
 		try {
-			config = { ...config, ...(await updateCollabConfig(localStorage.token, channelId, partial)) };
+			// W4-6/W4-7: enviem la versió actual com a expected_meta_version.
+			// El backend compara; si algú ha desat mentrestant, respon 409.
+			const version = config?.meta_version;
+			config = { ...config, ...(await updateCollabConfig(localStorage.token, channelId, partial, version)) };
 			await loadFiles();
 		} catch (e) {
-			toast.error(`${e}`);
+			const msg = `${e}`;
+			if (msg.includes('canviat') || msg.includes('Refresca')) {
+				// W4-7: 409 Conflict — un altre procés ha desat config mentrestant.
+				toast.message('⚠️ Config modificada per un altre procés. Refrescant…');
+			} else {
+				toast.error(msg);
+			}
 			await loadConfig();
 		}
 		saving = false;
@@ -255,36 +309,25 @@
 		files = [];
 	};
 
-	const useManualPath = async () => {
-		const path = manualPath.trim().replace(/^["']|["']$/g, '');
-		if (!path) return;
-		await save({ project_dir: path });
-		if (config?.project_dir) {
-			toast.success(`Carpeta del projecte: ${config.project_dir}`);
-			manualPath = '';
-			showBrowser = false;
-		}
-	};
-
-	const saveGuardrails = async () => {
+	// Un guardrail es desa a l'instant en canviar-lo (com el mode). Forma part
+	// de la config, així que 💾 Desa de Plantilles també el captura — no cal cap
+	// botó de desat separat.
+	const setGuardrail = async (key: string, raw: string) => {
 		if (!config) return;
-		const defaults = config.guardrail_defaults ?? {};
-		const guardrails: Record<string, number | boolean> = {};
-		for (const [key, raw] of Object.entries(guardrailDraft)) {
-			const def = defaults[key];
-			if (typeof def === 'boolean') {
-				guardrails[key] = raw === 'true' || raw === 'True';
-			} else {
-				const n = parseInt(raw, 10);
-				if (isNaN(n) || n < 0) {
-					toast.error(`Valor invàlid per ${key}`);
-					return;
-				}
-				guardrails[key] = n;
+		const def = (config.guardrail_defaults ?? {})[key];
+		let value: number | boolean;
+		if (typeof def === 'boolean') {
+			value = raw === 'true' || raw === 'True';
+		} else {
+			const n = parseInt(raw, 10);
+			if (isNaN(n) || n < 0) {
+				toast.error(`Valor invàlid per ${key}`);
+				return;
 			}
+			value = n;
 		}
-		await save({ guardrails });
-		toast.success('Guardarails actualitzats (efecte immediat).');
+		guardrailDraft[key] = String(value);
+		await save({ guardrails: { ...(config.guardrails ?? {}), [key]: value } });
 	};
 
 	const startRound = async () => {
@@ -301,10 +344,25 @@
 		}
 	};
 
+	const cancelTurn = async () => {
+		try {
+			const res = await cancelCollabTurn(localStorage.token, channelId);
+			toast.message(
+				res?.cancelled
+					? 'Torn en curs tallat; la conversa continua amb el següent.'
+					: 'No hi ha cap torn en curs per tallar.'
+			);
+		} catch (e) {
+			toast.error(`${e}`);
+		}
+	};
+
 	const stopRound = async () => {
 		try {
 			const res = await stopCollabRound(localStorage.token, channelId);
-			toast.message(res?.stopped ? "S'aturarà en acabar el torn en curs." : "L'equip no està treballant ara.");
+			toast.message(
+				res?.stopped ? "S'aturarà en acabar el torn en curs." : "L'equip no està treballant ara."
+			);
 			await loadConfig();
 		} catch (e) {
 			toast.error(`${e}`);
@@ -331,36 +389,55 @@
 		}, 1500);
 	};
 
-	onMount(async () => {
-		await loadConfig();
-		await loadFiles();
-		await loadTasks();
-		$socket?.on('events:channel', channelEventHandler);
-		pollInterval = setInterval(loadConfig, 7000);
-	});
+	onMount(() => {
+		let destroyed = false;
+		const refreshWhenVisible = () => {
+			if (document.visibilityState === 'visible') void loadConfig();
+		};
 
-	onDestroy(() => {
-		$socket?.off('events:channel', channelEventHandler);
-		if (pollInterval) clearInterval(pollInterval);
-		if (refreshTimeout) clearTimeout(refreshTimeout);
+		$socket?.on('events:channel', channelEventHandler);
+		document.addEventListener('visibilitychange', refreshWhenVisible);
+		void (async () => {
+			await loadConfig();
+			await loadFiles();
+			await loadTasks();
+			if (destroyed) return;
+			pollInterval = setInterval(refreshWhenVisible, CONFIG_RESYNC_MS);
+		})();
+
+		return () => {
+			destroyed = true;
+			$socket?.off('events:channel', channelEventHandler);
+			document.removeEventListener('visibilitychange', refreshWhenVisible);
+			if (pollInterval) clearInterval(pollInterval);
+			if (refreshTimeout) clearTimeout(refreshTimeout);
+		};
 	});
 </script>
 
 <div class="h-full w-full flex flex-col bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-100">
 	<!-- Capçalera -->
-	<div class="flex items-center justify-between px-4 py-3 border-b border-gray-100 dark:border-gray-850">
+	<div
+		class="flex items-center justify-between px-4 py-3 border-b border-gray-100 dark:border-gray-850"
+	>
 		<div class="flex items-center gap-2 font-medium">
 			<span>🤝 Taula rodona</span>
 			{#if config?.active}
-				<span class="text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300 animate-pulse">
+				<span
+					class="text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300 animate-pulse"
+				>
 					equip treballant
 				</span>
 			{:else if config?.enabled}
-				<span class="text-xs px-2 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300">
+				<span
+					class="text-xs px-2 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300"
+				>
 					activa
 				</span>
 			{:else}
-				<span class="text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400">
+				<span
+					class="text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400"
+				>
 					inactiva
 				</span>
 			{/if}
@@ -377,6 +454,7 @@
 			class="text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 text-lg leading-none"
 			on:click={onClose}
 			title="Tanca el panell"
+			aria-label="Tanca el panell de la taula rodona"
 		>
 			✕
 		</button>
@@ -405,6 +483,13 @@
 						>
 							⏹ Atura l'equip
 						</button>
+						<button
+							class="px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-600 text-white hover:bg-amber-700"
+							title="Talla NOMÉS el torn de l'agent en curs (la conversa continua amb el següent). Per aturar tot l'equip, usa ⏹."
+							on:click={cancelTurn}
+						>
+							✂ Talla el torn
+						</button>
 					{:else}
 						<button
 							class="px-3 py-1.5 rounded-lg text-xs font-medium bg-blue-600 text-white hover:bg-blue-700"
@@ -416,9 +501,42 @@
 				{/if}
 			</div>
 
-			<!-- Agents -->
-			<div>
-				<div class="font-medium mb-1.5">Agents d’aquesta taula</div>
+			<CollabProfiles
+				{channelId}
+				agents={config.agents}
+				{modelName}
+				canManage={config.can_manage ?? false}
+				onChanged={async () => {
+					// Una plantilla mana sobre TOT: recarrega config, tauler i arbre.
+					await loadConfig();
+					await loadTasks();
+					await loadFiles();
+				}}
+			>
+			<!-- Mode de conversa: UN sol selector, sota la selecció de plantilles -->
+			<div slot="mode">
+			<CollabSection title="🔀 Mode de conversa">
+				<select
+					class="w-full text-xs rounded-lg px-2 py-1.5 bg-gray-50 dark:bg-gray-850 border border-gray-200 dark:border-gray-800 outline-none"
+					value={unifiedMode}
+					on:change={(e) => setUnifiedMode(e.currentTarget.value)}
+				>
+					<option value="lliure"
+						>🗣️ Conversa lliure — tothom parla quan vol i els teus missatges s'incorporen al moment</option
+					>
+					<option value="rondes"
+						>🔁 Rondes — l'equip acaba la ronda en curs abans d'incorporar el teu missatge</option
+					>
+					<option value="torns"
+						>📋 Torns fixos — una passada ordenada per tots els agents i s'atura</option
+					>
+				</select>
+			</CollabSection>
+			</div>
+
+			<!-- Agents: contingut del slot per defecte; CollabProfiles ja
+			     l'embolcalla amb la seva secció col·lapsable (que també conté
+			     la personalització per agent). -->
 				{#if config.agents.length === 0}
 					<div class="text-xs text-gray-400 mb-1.5">Cap agent. Afegeix-ne com a mínim dos.</div>
 				{/if}
@@ -429,19 +547,21 @@
 							class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs {downInfo
 								? 'bg-red-100 text-red-700 dark:bg-red-900/60 dark:text-red-300'
 								: 'bg-gray-100 dark:bg-gray-800'}"
-							title={downInfo ? `Caigut: ${downInfo.reason}` : ''}
+							title={downInfo ? `Caigut: ${downInfo.reason}` : agentId}
 						>
 							{downInfo ? '🔻 ' : ''}{modelName(agentId)}
 							{#if downInfo}
 								<button
 									class="hover:scale-110 transition"
 									title="Reintenta aquest agent ara"
+									aria-label={`Reintenta l'agent ${modelName(agentId)}`}
 									on:click={() => retryAgent(agentId)}>🔄</button
 								>
 							{/if}
 							<button
 								class="text-gray-400 hover:text-red-500"
 								title="Treu l’agent"
+								aria-label={`Treu l'agent ${modelName(agentId)}`}
 								on:click={() => removeAgent(agentId)}>✕</button
 							>
 						</span>
@@ -454,7 +574,7 @@
 					>
 						<option value="">— tria un model —</option>
 						{#each $models.filter((m) => !config.agents.includes(m.id)) as model}
-							<option value={model.id}>{model.name}</option>
+							<option value={model.id} title={model.id}>{modelLabel(model)}</option>
 						{/each}
 					</select>
 					<button
@@ -465,37 +585,40 @@
 						Afegeix
 					</button>
 				</div>
-			</div>
+			</CollabProfiles>
 
 			<!-- Carpeta-projecte -->
-			<div>
-				<div class="font-medium mb-1.5">Carpeta del projecte</div>
-				{#if config.project_dir}
-					<div class="flex items-center gap-1.5 mb-1.5">
-						<input
-							type="text"
-							class="flex-1 text-xs px-2 py-1.5 rounded-lg bg-gray-50 dark:bg-gray-850 border {projectDirEdit !==
-							config.project_dir
-								? 'border-amber-400 dark:border-amber-600'
-								: 'border-gray-200 dark:border-gray-800'} outline-none"
-							title="Pots editar la ruta directament (Enter per desar)"
-							bind:value={projectDirEdit}
-							on:keydown={(e) => e.key === 'Enter' && save({ project_dir: projectDirEdit.trim() })}
-						/>
-						{#if projectDirEdit !== config.project_dir}
-							<button
-								class="px-2 py-1 rounded-lg text-xs bg-emerald-600 text-white hover:bg-emerald-700"
-								title="Desa la ruta editada"
-								on:click={() => save({ project_dir: projectDirEdit.trim() })}>✔</button
-							>
-						{/if}
+			<CollabSection title="📁 Carpeta del projecte">
+				<!-- Una sola entrada de ruta, sempre visible: editar-la o escriure
+				     una de nova; Enter o ✔ la desa. -->
+				<div class="flex items-center gap-1.5 mb-1.5">
+					<input
+						type="text"
+						placeholder="Escriu la ruta: D:\Projectes\el-meu-projecte"
+						class="flex-1 text-xs px-2 py-1.5 rounded-lg bg-gray-50 dark:bg-gray-850 border {projectDirEdit !==
+						(config.project_dir ?? '')
+							? 'border-amber-400 dark:border-amber-600'
+							: 'border-gray-200 dark:border-gray-800'} outline-none"
+						title="Escriu o edita la ruta i prem Enter (o ✔) per desar-la"
+						bind:value={projectDirEdit}
+						on:keydown={(e) => e.key === 'Enter' && save({ project_dir: projectDirEdit.trim() })}
+					/>
+					{#if projectDirEdit.trim() !== (config.project_dir ?? '')}
+						<button
+							class="px-2 py-1 rounded-lg text-xs bg-emerald-600 text-white hover:bg-emerald-700"
+							title="Desa la ruta"
+							on:click={() => save({ project_dir: projectDirEdit.trim() })}>✔</button
+						>
+					{/if}
+					{#if config.project_dir}
 						<button
 							class="text-xs text-gray-400 hover:text-red-500"
 							title="Treu la carpeta"
 							on:click={clearDir}>✕</button
 						>
-					</div>
-				{:else}
+					{/if}
+				</div>
+				{#if !config.project_dir && !projectDirEdit.trim()}
 					<div class="text-xs text-gray-400 mb-1.5">
 						Sense carpeta. Els agents no tindran accés a fitxers.
 					</div>
@@ -523,28 +646,13 @@
 					{/if}
 				</div>
 
-				<div class="flex gap-1.5 mt-1.5">
-					<input
-						type="text"
-						placeholder="…o escriu la ruta: D:\Projectes\el-meu-projecte"
-						class="flex-1 text-xs rounded-lg px-2 py-1.5 bg-gray-50 dark:bg-gray-850 border border-gray-200 dark:border-gray-800 outline-none"
-						bind:value={manualPath}
-						on:keydown={(e) => e.key === 'Enter' && useManualPath()}
-					/>
-					<button
-						class="px-3 py-1.5 rounded-lg text-xs bg-gray-200 dark:bg-gray-800 hover:bg-gray-300 dark:hover:bg-gray-700 disabled:opacity-40"
-						disabled={!manualPath.trim() || saving}
-						on:click={useManualPath}
-					>
-						Usa
-					</button>
-				</div>
-
 				{#if (config.recent_dirs ?? []).filter((d) => d !== config.project_dir).length > 0}
 					<div class="mt-1.5">
 						<div class="text-xs text-gray-400 mb-1">Recents:</div>
 						<div class="space-y-0.5">
-							{#each (config.recent_dirs ?? []).filter((d) => d !== config.project_dir).slice(0, 5) as dir}
+							{#each (config.recent_dirs ?? [])
+								.filter((d) => d !== config.project_dir)
+								.slice(0, 5) as dir}
 								<button
 									class="w-full text-left text-xs px-2 py-1 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 truncate text-gray-600 dark:text-gray-300"
 									title={`Usa ${dir}`}
@@ -601,24 +709,10 @@
 						</div>
 					</div>
 				{/if}
-			</div>
-
-			<!-- Mode -->
-			<div>
-				<div class="font-medium mb-1.5">Mode de torns</div>
-				<select
-					class="w-full text-xs rounded-lg px-2 py-1.5 bg-gray-50 dark:bg-gray-850 border border-gray-200 dark:border-gray-800 outline-none"
-					value={config.mode}
-					on:change={(e) => save({ mode: e.currentTarget.value })}
-				>
-					<option value="handraise">handraise — cada agent decideix si vol intervenir</option>
-					<option value="roundrobin">roundrobin — una passada per tots els agents</option>
-				</select>
-			</div>
+			</CollabSection>
 
 			<!-- Tauler de tasques de l'equip -->
-			<div>
-				<div class="font-medium mb-1.5">Tasques de l'equip</div>
+			<CollabSection title="✅ Tasques de l'equip" badge={tasks.length ? `${tasks.length}` : null}>
 				{#if tasks.length === 0}
 					<div class="text-xs text-gray-400 mb-1.5">
 						Cap tasca. Els agents en poden crear amb les seves eines, i tu des d'aquí.
@@ -628,7 +722,9 @@
 					{#each tasks as task (task.id)}
 						<div
 							class="flex items-center gap-1.5 text-xs rounded-lg px-2 py-1 bg-gray-50 dark:bg-gray-850 border border-gray-200 dark:border-gray-800"
-							title={task.notes ? `${task.notes} (creada per ${task.created_by})` : `creada per ${task.created_by}`}
+							title={task.notes
+								? `${task.notes} (creada per ${task.created_by})`
+								: `creada per ${task.created_by}`}
 						>
 							<select
 								class="bg-transparent outline-none"
@@ -639,7 +735,9 @@
 								<option value="doing">🔵</option>
 								<option value="done">✅</option>
 							</select>
-							<span class="flex-1 truncate {task.status === 'done' ? 'line-through text-gray-400' : ''}">
+							<span
+								class="flex-1 truncate {task.status === 'done' ? 'line-through text-gray-400' : ''}"
+							>
 								{task.title}{task.assignee ? ` → ${task.assignee}` : ''}
 							</span>
 							<button
@@ -666,30 +764,21 @@
 						Afegeix
 					</button>
 				</div>
-			</div>
+			</CollabSection>
 
 			<!-- Resum de la feina (mantingut pels agents) -->
 			{#if config.summary}
-				<div>
-					<div class="font-medium mb-1.5">Resum de la feina</div>
+				<CollabSection title="📝 Resum de la feina" open={false}>
 					<div
 						class="text-xs rounded-lg px-2.5 py-2 bg-gray-50 dark:bg-gray-850 border border-gray-200 dark:border-gray-800 whitespace-pre-wrap max-h-40 overflow-y-auto"
 					>
 						{config.summary}
 					</div>
-				</div>
+				</CollabSection>
 			{/if}
 
 			<!-- Guardarails -->
-			<div>
-				<button
-					class="font-medium mb-1.5 flex items-center gap-1"
-					on:click={() => (showGuardrails = !showGuardrails)}
-				>
-					<span class="text-xs">{showGuardrails ? '▼' : '▶'}</span> Guardarails
-					<span class="text-xs text-gray-400 font-normal">(0/false = desactivat)</span>
-				</button>
-				{#if showGuardrails}
+			<CollabSection title="🛡️ Guardarails" badge="0/false = desactivat" open={false}>
 					<div class="space-y-1.5">
 						{#each Object.entries(config.guardrail_defaults ?? {}) as [key, def]}
 							<div class="flex items-center gap-2" title={GUARDRAIL_INFO[key]?.help ?? key}>
@@ -700,8 +789,10 @@
 								{#if typeof def === 'boolean'}
 									<select
 										id={`gr-${key}`}
-										class="w-24 text-xs rounded-lg px-2 py-1 bg-gray-50 dark:bg-gray-850 border border-gray-200 dark:border-gray-800"
-										bind:value={guardrailDraft[key]}
+										class="w-24 text-xs rounded-lg px-2 py-1 bg-gray-50 dark:bg-gray-850 border border-gray-200 dark:border-gray-800 disabled:opacity-50"
+										value={guardrailDraft[key]}
+										disabled={saving}
+										on:change={(e) => setGuardrail(key, e.currentTarget.value)}
 									>
 										<option value="true">activat</option>
 										<option value="false">desactivat</option>
@@ -711,32 +802,28 @@
 										id={`gr-${key}`}
 										type="number"
 										min="0"
-										class="w-24 text-xs rounded-lg px-2 py-1 bg-gray-50 dark:bg-gray-850 border border-gray-200 dark:border-gray-800"
-										bind:value={guardrailDraft[key]}
+										class="w-24 text-xs rounded-lg px-2 py-1 bg-gray-50 dark:bg-gray-850 border border-gray-200 dark:border-gray-800 disabled:opacity-50"
+										value={guardrailDraft[key]}
+										disabled={saving}
+										on:change={(e) => setGuardrail(key, e.currentTarget.value)}
 									/>
 								{/if}
 							</div>
 						{/each}
-						<button
-							class="mt-1 px-3 py-1.5 rounded-lg text-xs bg-gray-200 dark:bg-gray-800 hover:bg-gray-300 dark:hover:bg-gray-700"
-							disabled={saving}
-							on:click={saveGuardrails}
-						>
-							Desa els guardarails
-						</button>
+						<p class="text-xs text-gray-500 mt-1">
+							Cada canvi es desa a l'instant i s'inclou en desar la plantilla.
+						</p>
 					</div>
-				{/if}
-			</div>
+			</CollabSection>
 
 			<!-- Fitxers del projecte -->
 			{#if config.project_dir}
-				<div>
-					<div class="font-medium mb-1.5 flex items-center justify-between">
-						<span>Fitxers del projecte</span>
+				<CollabSection title="🗂️ Fitxers del projecte" open={false}>
+					<div class="mb-1.5 flex items-center justify-end">
 						<button
 							class="text-xs text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
-							title="Refresca"
-							on:click={loadFiles}>⟳</button
+							title="Refresca la llista de fitxers"
+							on:click={loadFiles}>⟳ Refresca</button
 						>
 					</div>
 					<div
@@ -761,7 +848,7 @@
 							<div class="px-2.5 py-1 text-gray-400 italic">… llista tallada</div>
 						{/if}
 					</div>
-				</div>
+				</CollabSection>
 			{/if}
 		</div>
 	{/if}
@@ -778,8 +865,12 @@
 			<div
 				class="bg-white dark:bg-gray-900 rounded-xl shadow-2xl max-w-full max-h-full w-[48rem] flex flex-col overflow-hidden"
 				on:click|stopPropagation
-				on:keydown|stopPropagation
+				on:keydown|stopPropagation={(e) => e.key === 'Escape' && (viewerPath = null)}
 				role="dialog"
+				aria-modal="true"
+				aria-label={`Contingut del fitxer ${viewerPath}`}
+				tabindex="-1"
+				use:focusOnMount
 			>
 				<div
 					class="px-4 py-2.5 border-b border-gray-100 dark:border-gray-850 flex items-center justify-between text-sm"
@@ -787,6 +878,8 @@
 					<code class="truncate">{viewerPath}</code>
 					<button
 						class="text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 ml-3"
+						aria-label="Tanca el visor de fitxer"
+						title="Tanca el visor (Esc)"
 						on:click={() => (viewerPath = null)}>✕</button
 					>
 				</div>

@@ -4,6 +4,7 @@ Muntat a /api/v1/collab (vegeu el registre marcat # [collab-fork] a main.py).
 """
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -15,8 +16,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
 from open_webui.collab.config import (
+    CollabConfig,
     GUARDRAIL_DEFAULTS,
     VALID_MODES,
+    VALID_CONVERSATION_MODES,
     admin_only,
     allowed_project_roots,
     get_collab_config,
@@ -26,7 +29,34 @@ from open_webui.collab.config import (
     validate_project_dir,
 )
 from open_webui.collab.files import build_tree, list_dirs, read_text_file
-from open_webui.collab.orchestrator import is_round_active, request_stop, run_round
+from open_webui.collab.engine import list_events, list_receipts, receipt_summary
+from open_webui.collab.identity import resolve_channel_identities
+from open_webui.collab.orchestrator import (
+    cancel_turn,
+    is_round_active,
+    reconcile_channel,
+    request_stop,
+    run_round,
+)
+from open_webui.collab.profiles import (
+    ChannelConfigForm,
+    ProfileForm,
+    apply_profile,
+    create_profile,
+    delete_profile,
+    duplicate_profile,
+    ensure_channel_config,
+    export_profile_json,
+    get_channel_config,
+    get_channel_overrides,
+    get_profile,
+    list_profiles,
+    save_as_profile,
+    sync_channel_config_from_meta,
+    update_channel_config,
+    update_profile,
+    validate_imported_profile,
+)
 from open_webui.collab.tasks import (
     clear_down_agent,
     create_task,
@@ -73,6 +103,474 @@ async def _get_channel_checked(request: Request, channel_id: str, user, permissi
     return channel
 
 
+async def _validate_models(request: Request, agent_ids: list[str]) -> list[str]:
+    """Valida que els model_ids existeixin als models disponibles (W5.3 / S3).
+
+    Retorna la llista de model_ids invàlids (buida = tots vàlids).
+    Contrasta amb ``request.app.state.MODELS`` (la mateixa font que fa servir
+    main.py per resoldre els models de xat, pipes incloses). Si encara no està
+    poblat (p. ex. startup), no bloqueja (fail-open).
+    """
+    try:
+        models = getattr(request.app.state, "MODELS", None) or {}
+        if not models:
+            return []
+        return [a for a in agent_ids if a not in models]
+    except Exception:
+        log.warning("No s'han pogut validar els model IDs, saltant validació (fail-open)")
+        return []
+
+
+def _resolve_agent_display_names(
+    request: Request,
+    agents: list[str],
+    overrides: list[dict],
+) -> dict[str, str]:
+    """Resol el nom visible de cada agent seguint la jerarquia:
+    display_name del override > nom del model > agent_id."""
+    models = getattr(request.app.state, "MODELS", None) or {}
+    names: dict[str, str] = {}
+    for agent_id in agents:
+        override = next((o for o in overrides if o.get("model_id") == agent_id), None)
+        if override and override.get("display_name"):
+            names[agent_id] = override["display_name"]
+        elif agent_id in models and models[agent_id].get("name"):
+            names[agent_id] = models[agent_id]["name"]
+        else:
+            names[agent_id] = agent_id
+    return names
+
+
+############################
+# Perfils reutilitzables (W11/W12)
+# Aquestes rutes NO tenen {channel_id} perquè són globals per usuari.
+# Han d'anar ABANS de les rutes /{channel_id}/... per evitar conflictes.
+############################
+
+
+@router.get("/profiles")
+async def list_user_profiles(user=Depends(get_verified_user)):
+    return {"profiles": await list_profiles(user.id)}
+
+
+@router.post("/profiles")
+async def create_user_profile(form_data: ProfileForm, user=Depends(get_verified_user)):
+    _check_can_manage(user)
+    return {"profile": await create_profile(user.id, form_data)}
+
+
+@router.get("/profiles/{profile_id}")
+async def get_user_profile(profile_id: str, user=Depends(get_verified_user)):
+    profile = await get_profile(profile_id, user.id)
+    if not profile:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Perfil no trobat")
+    return {"profile": profile}
+
+
+@router.put("/profiles/{profile_id}")
+async def update_user_profile(
+    profile_id: str, form_data: ProfileForm, user=Depends(get_verified_user)
+):
+    _check_can_manage(user)
+    profile = await update_profile(profile_id, user.id, form_data)
+    if not profile:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Perfil no trobat")
+    return {"profile": profile}
+
+
+@router.delete("/profiles/{profile_id}")
+async def delete_user_profile(profile_id: str, user=Depends(get_verified_user)):
+    _check_can_manage(user)
+    if not await delete_profile(profile_id, user.id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Perfil no trobat o és un template del sistema (no es pot esborrar)",
+        )
+    return {"deleted": True}
+
+
+@router.post("/profiles/{profile_id}/duplicate")
+async def duplicate_user_profile(
+    profile_id: str,
+    new_name: str = "",
+    user=Depends(get_verified_user),
+):
+    _check_can_manage(user)
+    name = new_name.strip() or "Còpia de perfil"
+    profile = await duplicate_profile(profile_id, user.id, name)
+    if not profile:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Perfil no trobat")
+    return {"profile": profile}
+
+
+@router.get("/profiles/{profile_id}/export")
+async def export_user_profile(profile_id: str, user=Depends(get_verified_user)):
+    profile = await get_profile(profile_id, user.id)
+    if not profile:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Perfil no trobat")
+    return export_profile_json(profile)
+
+
+@router.post("/profiles/import")
+async def import_profile(data: dict, user=Depends(get_verified_user)):
+    _check_can_manage(user)
+    ok, error, form = validate_imported_profile(data)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error)
+    profile = await create_profile(user.id, form)
+    return {"profile": profile}
+
+
+############################
+# Presets de mode (W13)
+# Sense {channel_id}: han d'anar ABANS de les rutes /{channel_id}/...
+############################
+
+
+@router.get("/presets")
+async def list_collab_presets(user=Depends(get_verified_user)):
+    """Llista els modes predefinits (debate, standup, code_review, quick_help)."""
+    from open_webui.collab.presets import list_presets
+
+    return {"presets": list_presets()}
+
+
+@router.post("/{channel_id}/preset/apply")
+async def apply_preset_to_channel(
+    request: Request,
+    channel_id: str,
+    preset_key: str,
+    user=Depends(get_verified_user),
+):
+    """Aplica un preset al canal: mode + conversation_mode + guardrails.
+
+    Els guardrails es fusionen sobre els actuals (deep-merge `{**base, **preset}`);
+    els agents, la carpeta-projecte i l'estat enabled es conserven.
+    """
+    from open_webui.collab.presets import get_preset
+
+    _check_can_manage(user)
+    channel = await _get_channel_checked(request, channel_id, user, permission="write")
+    preset = get_preset(preset_key)
+    if not preset:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Preset desconegut: {preset_key}"
+        )
+
+    config = get_collab_config(channel)
+    config.mode = preset.mode
+    config.conversation_mode = preset.conversation_mode
+    config.guardrails = {**config.guardrails, **preset.guardrails}
+
+    ok, new_version = await save_collab_config(channel.id, config)
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="La configuració ha canviat mentrestant. Refresca i reintenta.",
+        )
+    await sync_channel_config_from_meta(channel.id, config.model_dump())
+    return {
+        **config.model_dump(),
+        "applied_preset": preset_key,
+        "meta_version": new_version,
+    }
+
+
+############################
+# Observabilitat: backpressure (W5.2)
+############################
+
+
+@router.get("/backpressure/stats")
+async def get_backpressure_stats(user=Depends(get_verified_user)):
+    """Retorna estadístiques dels semàfors de backpressure."""
+    from open_webui.collab.backpressure import stats as bp_stats
+
+    return bp_stats()
+
+
+############################
+# Config efectiva de canal: perfils + overrides (W11/W12)
+############################
+
+
+@router.get("/{channel_id}/channel-config")
+async def get_effective_channel_config(
+    request: Request, channel_id: str, user=Depends(get_verified_user)
+):
+    channel = await _get_channel_checked(request, channel_id, user)
+    config = get_collab_config(channel)
+    # Lazy migration: crea collab_channel_config si no existeix
+    cfg = await ensure_channel_config(channel_id, config.model_dump())
+    return {"channel_config": cfg}
+
+
+@router.put("/{channel_id}/channel-config")
+async def update_effective_channel_config(
+    request: Request,
+    channel_id: str,
+    form_data: ChannelConfigForm,
+    user=Depends(get_verified_user),
+):
+    _check_can_manage(user)
+    await _get_channel_checked(request, channel_id, user, permission="write")
+    ok, cfg = await update_channel_config(channel_id, form_data)
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="La configuració efectiva ha canviat mentrestant. Refresca i reintenta.",
+        )
+    return {"channel_config": cfg}
+
+
+@router.post("/{channel_id}/profile/apply")
+async def apply_profile_to_channel(
+    request: Request,
+    channel_id: str,
+    profile_id: str,
+    user=Depends(get_verified_user),
+):
+    _check_can_manage(user)
+    channel = await _get_channel_checked(request, channel_id, user, permission="write")
+    ok, cfg = await apply_profile(channel_id, profile_id, user.id)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Perfil no trobat")
+    return {"channel_config": cfg, "applied": True}
+
+
+@router.post("/{channel_id}/profile/reset")
+async def reset_channel_to_defaults(
+    request: Request,
+    channel_id: str,
+    user=Depends(get_verified_user),
+):
+    """«Plantilla predeterminada»: torna l'espai a l'estat intern de fàbrica.
+
+    Una plantilla defineix TOT l'estat de la taula; la predeterminada és la
+    pissarra neta: sense agents, sense carpeta, mode i guardrails per defecte,
+    sense personalitzacions ni tauler de tasques, i desvinculada de qualsevol
+    plantilla d'origen.
+    """
+    from open_webui.collab.tasks import replace_tasks
+
+    _check_can_manage(user)
+    channel = await _get_channel_checked(request, channel_id, user, permission="write")
+
+    config = CollabConfig()  # estat de fàbrica: enabled=False, agents=[], etc.
+
+    ok, new_version = await save_collab_config(channel.id, config)
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="La configuració ha canviat mentrestant. Refresca i reintenta.",
+        )
+    cfg = await update_channel_config(
+        channel.id,
+        ChannelConfigForm(config=config.model_dump(), agent_overrides=[], budget=None),
+    )
+    await replace_tasks(channel.id, [])
+    return {"channel_config": cfg[1] if isinstance(cfg, tuple) else cfg, "reset": True}
+
+
+class SaveAsProfileForm(BaseModel):
+    name: str = ""
+    description: str = ""
+    # Si s'indica, la fotografia del canal es desa DINS aquesta plantilla
+    # existent (en lloc de crear-ne una de nova).
+    profile_id: Optional[str] = None
+
+
+@router.post("/{channel_id}/profile/save")
+async def save_channel_as_profile(
+    request: Request,
+    channel_id: str,
+    form_data: SaveAsProfileForm,
+    user=Depends(get_verified_user),
+):
+    from open_webui.collab.profiles import save_into_profile
+
+    _check_can_manage(user)
+    await _get_channel_checked(request, channel_id, user, permission="write")
+    if form_data.profile_id:
+        profile = await save_into_profile(channel_id, form_data.profile_id, user.id)
+        if not profile:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Plantilla no trobada o el canal no té res a desar",
+            )
+        return {"profile": profile}
+    if not form_data.name.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cal un nom per crear una plantilla nova",
+        )
+    profile = await save_as_profile(channel_id, form_data.name, form_data.description, user.id)
+    if not profile:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Aquest canal encara no té configuració efectiva (crea-la primer)",
+        )
+    return {"profile": profile}
+
+
+############################
+# Identitat visual d'agents (W14)
+############################
+
+
+@router.get("/{channel_id}/agents/identity")
+async def get_agents_identity(
+    request: Request, channel_id: str, user=Depends(get_verified_user)
+):
+    """Retorna la identitat visual efectiva de cada agent del canal.
+
+    Fusiona els overrides del perfil/canal amb els fallbacks (color per hash
+    de nom, avatar per inicial, sense rol).
+
+    El nom visible segueix la jerarquia: display_name del override > nom del
+    model > agent_id.
+    """
+    channel = await _get_channel_checked(request, channel_id, user)
+    config = get_collab_config(channel)
+    overrides = await get_channel_overrides(channel_id)
+    agent_names = _resolve_agent_display_names(request, config.agents, overrides)
+    identities = resolve_channel_identities(
+        agents=config.agents,
+        agent_names=agent_names,
+        overrides=overrides,
+    )
+    return {
+        "identities": [ai.to_dict() for ai in identities],
+    }
+
+
+############################
+# Circuit breaker i salut d'agents (W5.1)
+############################
+
+
+@router.get("/{channel_id}/agents/circuit")
+async def get_agents_circuit_status(
+    request: Request, channel_id: str, user=Depends(get_verified_user)
+):
+    """Retorna l'estat del circuit breaker de tots els agents del canal."""
+    from open_webui.collab.circuit_breaker import list_circuits
+
+    channel = await _get_channel_checked(request, channel_id, user)
+    config = get_collab_config(channel)
+    circuits = await list_circuits(channel_id, config.agents)
+    return {
+        "circuits": [c.to_dict() for c in circuits],
+    }
+
+
+@router.post("/{channel_id}/agents/{agent_id}/circuit/reset")
+async def reset_agent_circuit(
+    request: Request, channel_id: str, agent_id: str, user=Depends(get_verified_user)
+):
+    """Reset manual del circuit breaker d'un agent."""
+    from open_webui.collab.circuit_breaker import reset_circuit
+
+    _check_can_manage(user)
+    await _get_channel_checked(request, channel_id, user, permission="write")
+    await reset_circuit(channel_id, agent_id)
+    return {"reset": True, "agent_id": agent_id}
+
+
+############################
+# Pressupost i degradació (W15 Capa 2/3)
+############################
+
+
+@router.get("/{channel_id}/budget/status")
+async def get_budget_status(
+    request: Request, channel_id: str, user=Depends(get_verified_user)
+):
+    """Retorna l'estat del pressupost del canal, incloent si està degradat.
+
+    W15 Capa 3: el frontend usa aquest endpoint per mostrar el xip "⚡ Estalvi".
+    """
+    from open_webui.collab.budget import check_budget, DEFAULT_DEGRADATION_THRESHOLD
+    from open_webui.collab.profiles import get_channel_config as get_cfg
+    from open_webui.collab.usage import get_channel_usage
+
+    await _get_channel_checked(request, channel_id, user)
+    cfg = await get_cfg(channel_id)
+    budget = cfg.get("budget") if cfg else None
+    usage = await get_channel_usage(channel_id)
+    degraded = False
+    if budget:
+        decision = await check_budget(channel_id, "_status_check", "any", budget)
+        degraded = decision.degraded
+    return {
+        "degraded": degraded,
+        "threshold": DEFAULT_DEGRADATION_THRESHOLD,
+        "budget": budget,
+        "usage": usage,
+    }
+
+
+############################
+# Estat persistent / re-sync
+############################
+
+
+@router.get("/{channel_id}/events")
+async def get_collab_events(
+    request: Request,
+    channel_id: str,
+    since: int = 0,
+    limit: int = 200,
+    user=Depends(get_verified_user),
+):
+    await _get_channel_checked(request, channel_id, user)
+    events = await list_events(channel_id, since=max(0, since), limit=limit)
+    return {
+        "events": [
+            {
+                "id": event.id,
+                "seq": event.seq,
+                "type": event.type,
+                "agent_id": event.agent_id,
+                "message_id": event.message_id,
+                "payload": event.payload or {},
+                "status": event.status,
+                "created_at": event.created_at,
+            }
+            for event in events
+        ]
+    }
+
+
+@router.get("/{channel_id}/receipts/{event_seq}")
+async def get_collab_receipts(
+    request: Request,
+    channel_id: str,
+    event_seq: int,
+    user=Depends(get_verified_user),
+):
+    await _get_channel_checked(request, channel_id, user)
+    if event_seq < 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="event_seq ha de ser positiu",
+        )
+    receipts = await list_receipts(channel_id, event_seq)
+    return {
+        "event_seq": event_seq,
+        "receipts": [
+            {
+                "agent_id": receipt.agent_id,
+                "state": receipt.state,
+                "message_id": receipt.message_id,
+                "updated_at": receipt.updated_at,
+            }
+            for receipt in receipts
+        ],
+        "summary": await receipt_summary(channel_id, event_seq),
+    }
+
+
 ############################
 # Config de l'espai
 ############################
@@ -83,8 +581,10 @@ class CollabConfigForm(BaseModel):
     agents: Optional[list[str]] = None
     project_dir: Optional[str] = None  # "" per treure-la
     mode: Optional[str] = None
+    conversation_mode: Optional[str] = None
     guardrails: Optional[dict] = None
     phase: Optional[str] = None  # "planning" | "execution" (canvi manual de fase)
+    expected_meta_version: Optional[int] = None  # versionatge optimista (W4-6)
 
 
 @router.get("/{channel_id}/config")
@@ -96,11 +596,13 @@ async def get_config(request: Request, channel_id: str, user=Depends(get_verifie
         "active": is_round_active(channel.id),
         "guardrail_defaults": GUARDRAIL_DEFAULTS,
         "modes": list(VALID_MODES),
+        "conversation_modes": list(VALID_CONVERSATION_MODES),
         "summary": await get_summary(channel.id),
         "phase": await get_phase(channel.id),
         "can_manage": not admin_only() or user.role == "admin",
         "recent_dirs": await get_recent_dirs(),
         "down_agents": await get_down_agents(channel.id),
+        "meta_version": channel.meta_version or 0,  # W4-6: per al versionatge optimista
     }
 
 
@@ -114,6 +616,13 @@ async def update_config(
 
     if form_data.agents is not None:
         config.agents = [a for a in form_data.agents if isinstance(a, str) and a]
+        # W5.3 (S3): valida que els model_ids existeixin
+        invalid = await _validate_models(request, config.agents)
+        if invalid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Models no disponibles: {', '.join(invalid)}",
+            )
 
     if form_data.project_dir is not None:
         if form_data.project_dir.strip() == "":
@@ -129,6 +638,14 @@ async def update_config(
         if form_data.mode not in VALID_MODES:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Mode invàlid: {form_data.mode}")
         config.mode = form_data.mode
+
+    if form_data.conversation_mode is not None:
+        if form_data.conversation_mode not in VALID_CONVERSATION_MODES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Mode de conversa invàlid: {form_data.conversation_mode}",
+            )
+        config.conversation_mode = form_data.conversation_mode
 
     if form_data.guardrails is not None:
         cleaned = {}
@@ -157,11 +674,22 @@ async def update_config(
         if not form_data.enabled:
             request_stop(channel.id)
 
-    await save_collab_config(channel.id, config)
+    # W4-6: versionatge optimista.  Si expected_meta_version no coincideix amb
+    # la versió actual, respon 409 Conflict perquè el client rellegeixi i reintenti.
+    ok, new_version = await save_collab_config(
+        channel.id, config, expected_version=form_data.expected_meta_version
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="La configuració ha canviat mentrestant. Refresca i reintenta.",
+        )
+    await sync_channel_config_from_meta(channel.id, config.model_dump())
     return {
         **config.model_dump(),
         "active": is_round_active(channel.id),
         "phase": await get_phase(channel.id),
+        "meta_version": new_version,
     }
 
 
@@ -182,6 +710,7 @@ async def start_round(request: Request, channel_id: str, user=Depends(get_verifi
         )
     if is_round_active(channel.id):
         return {"active": True, "started": False}
+    await reconcile_channel(channel.id)
     asyncio.create_task(run_round(request, channel, user))
     return {"active": True, "started": True}
 
@@ -192,6 +721,16 @@ async def stop_round(request: Request, channel_id: str, user=Depends(get_verifie
     channel = await _get_channel_checked(request, channel_id, user, permission="write")
     stopped = request_stop(channel.id)
     return {"stopped": stopped}
+
+
+@router.post("/{channel_id}/turn/cancel")
+async def cancel_channel_turn(
+    request: Request, channel_id: str, user=Depends(get_verified_user)
+):
+    _check_can_manage(user)
+    channel = await _get_channel_checked(request, channel_id, user, permission="write")
+    cancelled = await cancel_turn(channel.id, reason="user_requested")
+    return {"cancelled": cancelled}
 
 
 class RetryAgentForm(BaseModel):

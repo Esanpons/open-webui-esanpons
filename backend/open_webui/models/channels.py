@@ -53,6 +53,10 @@ class Channel(Base):
     data = Column(JSON, nullable=True)
     meta = Column(JSON, nullable=True)
 
+    # Optimistic-locking version for meta (W4-6).  Incremented on every meta write;
+    # callers can pass expected_meta_version to detect concurrent modifications.
+    meta_version = Column(BigInteger, nullable=False, default=0)
+
     created_at = Column(BigInteger)
 
     updated_at = Column(BigInteger)
@@ -80,6 +84,7 @@ class ChannelModel(BaseModel):
 
     data: Optional[dict] = None
     meta: Optional[dict] = None
+    meta_version: int = 0
     access_grants: list[AccessGrantModel] = Field(default_factory=list)
 
     created_at: int  # timestamp in epoch (time_ns)
@@ -842,6 +847,7 @@ class ChannelTable:
 
             channel.data = form_data.data
             channel.meta = form_data.meta
+            channel.meta_version = (channel.meta_version or 0) + 1
 
             if form_data.access_grants is not None:
                 await AccessGrants.set_access_grants('channel', id, form_data.access_grants, db=db)

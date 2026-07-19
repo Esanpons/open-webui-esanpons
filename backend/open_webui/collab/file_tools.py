@@ -17,7 +17,7 @@ from open_webui.utils.tools import get_tool_specs
 log = logging.getLogger(__name__)
 
 COLLAB_TOOL_ID = "collab_files"
-COLLAB_TOOL_VERSION = "3"  # puja-ho quan canviï TOOL_CONTENT per forçar re-registre
+COLLAB_TOOL_VERSION = "4"  # puja-ho quan canviï TOOL_CONTENT per forçar re-registre
 
 TOOL_CONTENT = '''"""
 title: Espai col·laboratiu (fitxers + tasques)
@@ -54,6 +54,10 @@ def _agent_name(__metadata__: dict) -> str:
     return model.get("name") or model.get("id") or "agent"
 
 
+def _turn_id(__metadata__: dict) -> str:
+    return _collab(__metadata__).get("turn_id") or ""
+
+
 class Tools:
     def list_project_files(self, __metadata__: dict = {}) -> str:
         """
@@ -77,7 +81,7 @@ class Tools:
         ok, result = read_text_file(project_dir, path)
         return result if ok else f"ERROR: {result}"
 
-    def write_project_file(self, path: str, content: str, __metadata__: dict = {}) -> str:
+    async def write_project_file(self, path: str, content: str, __metadata__: dict = {}) -> str:
         """
         Escriu (crea o sobreescriu completament) un fitxer de text del projecte compartit. Crea les carpetes intermèdies si cal.
         :param path: Ruta relativa del fitxer dins del projecte (p.ex. "src/app.py").
@@ -87,8 +91,18 @@ class Tools:
         project_dir = _project_dir(__metadata__)
         if not project_dir:
             return "Aquest espai no té carpeta-projecte configurada."
-        ok, result = write_text_file(project_dir, path, content)
-        return result if ok else f"ERROR: {result}"
+        turn_id = _turn_id(__metadata__)
+        locked = False
+        if turn_id:
+            from open_webui.collab.orchestrator import lock_turn_tool
+            locked = lock_turn_tool(turn_id, "write_project_file")
+        try:
+            ok, result = write_text_file(project_dir, path, content)
+            return result if ok else f"ERROR: {result}"
+        finally:
+            if locked:
+                from open_webui.collab.orchestrator import unlock_turn_tool
+                unlock_turn_tool(turn_id)
 
     async def list_tasks(self, __metadata__: dict = {}) -> str:
         """
@@ -172,11 +186,23 @@ class Tools:
         channel_id = _channel_id(__metadata__)
         if not channel_id:
             return "ERROR: no s'ha pogut identificar l'espai."
-        await collab_tasks.set_end_proposal(channel_id, _agent_name(__metadata__), summary)
-        return (
-            "Proposta de tancament registrada. En acabar el teu torn, la resta "
-            "d'agents votaran si la feina està acabada."
-        )
+        turn_id = _turn_id(__metadata__)
+        locked = False
+        if turn_id:
+            from open_webui.collab.orchestrator import lock_turn_tool
+            locked = lock_turn_tool(turn_id, "propose_finish")
+        try:
+            await collab_tasks.set_end_proposal(
+                channel_id, _agent_name(__metadata__), summary
+            )
+            return (
+                "Proposta de tancament registrada. En acabar el teu torn, la resta "
+                "d'agents votaran si la feina està acabada."
+            )
+        finally:
+            if locked:
+                from open_webui.collab.orchestrator import unlock_turn_tool
+                unlock_turn_tool(turn_id)
 '''
 
 

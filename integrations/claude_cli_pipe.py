@@ -60,6 +60,19 @@ def _collab_ctx(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return ctx if isinstance(ctx, dict) else {}
 
 
+def _effective_timeout(collab: Dict[str, Any], normal_timeout: int, fallback: int) -> int | None:
+    """Usa el guardrail del canal; 0 és sense límit i absència usa la valve."""
+    if not collab:
+        return normal_timeout
+    if "turn_timeout" not in collab:
+        return fallback
+    try:
+        configured = int(collab["turn_timeout"])
+    except (TypeError, ValueError):
+        return fallback
+    return configured if configured > 0 else None
+
+
 def _resolve_claude() -> List[str]:
     """Return the argv prefix to invoke the claude CLI, handling the Windows
     .CMD shim (subprocess can't exec it directly → route through cmd /c), the
@@ -127,7 +140,14 @@ class Pipe:
         )
         TIMEOUT_SECONDS: int = Field(
             default=300,
-            description="Max seconds to wait for a Claude reply before giving up.",
+            description="Max seconds to wait for a normal Claude chat reply.",
+        )
+        COLLAB_TIMEOUT_SECONDS: int = Field(
+            default=570,
+            description=(
+                "Max seconds for a collaborative Claude turn. Must remain below "
+                "the orchestrator hard timeout (600s) so cleanup stays coordinated."
+            ),
         )
 
     def __init__(self) -> None:
@@ -183,6 +203,9 @@ class Pipe:
         # (vols intervenir?) són one-shot: sense sessió, per no embrutar la
         # conversa del canal.
         collab = _collab_ctx(__metadata__)
+        timeout_seconds = _effective_timeout(
+            collab, self.valves.TIMEOUT_SECONDS, self.valves.COLLAB_TIMEOUT_SECONDS
+        )
         project_dir = collab.get("project_dir")
         if project_dir and not os.path.isdir(project_dir):
             project_dir = None
@@ -232,12 +255,12 @@ class Pipe:
                 try:
                     stdout_bytes, stderr_bytes = await asyncio.wait_for(
                         proc.communicate(input=prompt.encode("utf-8")),
-                        timeout=self.valves.TIMEOUT_SECONDS,
+                        timeout=timeout_seconds,
                     )
                 except asyncio.TimeoutError:
                     proc.kill()
                     await emit_status("Timeout.", done=True)
-                    yield f"\n\n**Claude error:** timed out after {self.valves.TIMEOUT_SECONDS}s.\n"
+                    yield f"\n\n**Claude error:** timed out after {timeout_seconds}s.\n"
                     return
                 except asyncio.CancelledError:
                     # Qui ens crida (p.ex. el timeout de mà alçada de la taula

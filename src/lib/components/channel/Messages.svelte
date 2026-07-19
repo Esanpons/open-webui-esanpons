@@ -14,6 +14,8 @@
 	import { settings, user } from '$lib/stores';
 
 	import Message from './Messages/Message.svelte';
+	// [collab-fork] franja W9: receipts dels agents sota cada missatge humà
+	import CollabMessageReceipts from '../collab/CollabMessageReceipts.svelte';
 	import Loader from '../common/Loader.svelte';
 	import Spinner from '../common/Spinner.svelte';
 	import {
@@ -24,6 +26,10 @@
 		updateMessage
 	} from '$lib/apis/channels';
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
+	import {
+		getCollabAgentIdentities,
+		type CollabAgentIdentity
+	} from '$lib/apis/collab';
 
 	const i18n = getContext('i18n');
 
@@ -40,6 +46,30 @@
 	export let onPin: Function = () => {};
 
 	let messagesLoading = false;
+	let collabIdentities: Record<string, CollabAgentIdentity> = {};
+	let identitiesChannelId: string | null = null;
+
+	const loadCollabIdentities = async () => {
+		if (!channel?.id || thread) {
+			collabIdentities = {};
+			identitiesChannelId = null;
+			return;
+		}
+		if (identitiesChannelId === channel.id) return;
+		identitiesChannelId = channel.id;
+		try {
+			const response = await getCollabAgentIdentities(localStorage.token, channel.id);
+			collabIdentities = Object.fromEntries(
+				(response?.identities ?? []).map((identity) => [identity.agent_id, identity])
+			);
+		} catch {
+			// Un canal normal o sense permisos no té identitats col·laboratives.
+			collabIdentities = {};
+		}
+	};
+
+	onMount(loadCollabIdentities);
+	$: if (channel?.id) void loadCollabIdentities();
 
 	const loadMoreMessages = async () => {
 		// scroll slightly down to disable continuous loading
@@ -128,6 +158,7 @@
 			<Message
 				{message}
 				{channel}
+				{collabIdentities}
 				{thread}
 				{id}
 				replyToMessage={replyToMessage?.id === message.id}
@@ -254,6 +285,15 @@
 					}
 				}}
 			/>
+
+			<!-- [collab-fork] franja W9 (no renderitza res si el missatge no té ronda) -->
+			{#if channel?.id && !thread}
+				<CollabMessageReceipts
+					channelId={channel.id}
+					messageId={message.id}
+					identities={collabIdentities}
+				/>
+			{/if}
 		{/each}
 
 		<div class="pb-6" />

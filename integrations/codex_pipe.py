@@ -73,6 +73,19 @@ def _collab_ctx(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return ctx if isinstance(ctx, dict) else {}
 
 
+def _effective_timeout(collab: Dict[str, Any], normal_timeout: int, fallback: int) -> int | None:
+    """Usa el guardrail del canal; 0 és sense límit i absència usa la valve."""
+    if not collab:
+        return normal_timeout
+    if "turn_timeout" not in collab:
+        return fallback
+    try:
+        configured = int(collab["turn_timeout"])
+    except (TypeError, ValueError):
+        return fallback
+    return configured if configured > 0 else None
+
+
 def _codex_base() -> List[str]:
     """Return the argv to invoke Codex with no shell.
 
@@ -183,7 +196,14 @@ class Pipe:
         )
         TIMEOUT_SECONDS: int = Field(
             default=300,
-            description="Max seconds to wait for a Codex reply before giving up.",
+            description="Max seconds to wait for a normal Codex chat reply.",
+        )
+        COLLAB_TIMEOUT_SECONDS: int = Field(
+            default=570,
+            description=(
+                "Max seconds for a collaborative Codex turn. Must remain below "
+                "the orchestrator hard timeout (600s) so cleanup stays coordinated."
+            ),
         )
         IMAGE_GENERATION: bool = Field(
             default=True,
@@ -274,6 +294,9 @@ class Pipe:
         # (com `codex` al terminal dins la carpeta) i amb sandbox d'escriptura.
         # Les crides de "mà alçada" (vols intervenir?) són one-shot, sense sessió.
         collab = _collab_ctx(__metadata__)
+        timeout_seconds = _effective_timeout(
+            collab, self.valves.TIMEOUT_SECONDS, self.valves.COLLAB_TIMEOUT_SECONDS
+        )
         project_dir = collab.get("project_dir")
         if project_dir and not os.path.isdir(project_dir):
             project_dir = None
@@ -365,12 +388,12 @@ class Pipe:
                 try:
                     stdout_bytes, _ = await asyncio.wait_for(
                         proc.communicate(input=prompt.encode("utf-8")),
-                        timeout=self.valves.TIMEOUT_SECONDS,
+                        timeout=timeout_seconds,
                     )
                 except asyncio.TimeoutError:
                     proc.kill()
                     await emit_status("Timeout.", done=True)
-                    yield f"\n\n**Codex error:** timed out after {self.valves.TIMEOUT_SECONDS}s.\n"
+                    yield f"\n\n**Codex error:** timed out after {timeout_seconds}s.\n"
                     return
                 except asyncio.CancelledError:
                     proc.kill()

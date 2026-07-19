@@ -13,7 +13,7 @@ from typing import Optional
 from open_webui.internal.db import get_async_db_context
 from open_webui.models.channels import Channel, ChannelModel
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 log = logging.getLogger(__name__)
 
@@ -32,19 +32,28 @@ GUARDRAIL_DEFAULTS = {
     # Segons màxims per resposta de "vols intervenir?". 0 = sense timeout.
     "handraise_timeout": 180,
     # Quants missatges recents del canal es passen com a context a cada agent.
-    "context_messages": 30,
-    # Filosofia d'equip: PRIMER planificar junts (fase 📋), i només quan el pla
+    # Es manté baix a propòsit: el resum incremental (auto_summary) cobreix la
+    # part antiga de la conversa amb molts menys tokens que els missatges crus.
+    "context_messages": 15,
+    # La decisió de mà alçada només necessita el tram més recent. Mantenir-la
+    # curta redueix latència i evita TPM/request-too-large en models gratuïts.
+    # 0 = reutilitzar tot el context_messages general.
+    "handraise_context_messages": 8,
+    # Filosofia d'equip: primer planificar junts (fase 📋), i només quan el pla
     # està consensuat (vot PLA_ACORDAT) es passa a executar (fase 🔨).
     # Desactivat = els agents planifiquen i executen lliurement.
     "require_planning": True,
     # En acabar una ronda amb feina feta, generar/actualitzar el resum
-    # incremental de l'espai (1 crida curta extra per ronda).
-    "auto_summary": False,
+    # incremental de l'espai (1 crida curta extra per ronda). Actiu per
+    # defecte: permet treballar amb un context de missatges molt més curt
+    # (estalvi net de tokens a cada torn de cada agent).
+    "auto_summary": True,
     # Segons màxims que pot durar una ronda sencera. 0 = sense límit.
     "max_round_seconds": 0,
 }
 
 VALID_MODES = ("handraise", "roundrobin")
+VALID_CONVERSATION_MODES = ("rounds", "continuous")
 
 
 class CollabConfig(BaseModel):
@@ -57,6 +66,10 @@ class CollabConfig(BaseModel):
     # handraise: després de cada missatge es pregunta a cada agent si vol
     # intervenir. roundrobin: una passada per tots els agents en ordre.
     mode: str = "handraise"
+    # continuous (per defecte): conversa fluida — les entrades humanes
+    # s'incorporen al torn següent sense esperar que la ronda acabi.
+    # rounds: es tanca la ronda en curs abans d'incorporar el missatge nou.
+    conversation_mode: str = "continuous"
     # Només es guarden els overrides; la resta agafa GUARDRAIL_DEFAULTS.
     guardrails: dict = Field(default_factory=dict)
 
@@ -70,6 +83,7 @@ class CollabConfig(BaseModel):
             f"**Agents:** {', '.join(self.agents) if self.agents else '(cap)'}",
             f"**Projecte:** `{self.project_dir}`" if self.project_dir else "**Projecte:** (cap carpeta)",
             f"**Mode:** {self.mode}",
+            f"**Conversa:** {self.conversation_mode}",
             "**Guardarails** (0/off = desactivat):",
         ]
         for key in GUARDRAIL_DEFAULTS:
@@ -88,16 +102,56 @@ def get_collab_config(channel: ChannelModel) -> CollabConfig:
         return CollabConfig()
 
 
-async def save_collab_config(channel_id: str, config: CollabConfig) -> bool:
-    """Desa la config a channel.meta['collab'] sense tocar cap altre camp."""
+async def save_collab_config(
+    channel_id: str,
+    config: CollabConfig,
+    *,
+    expected_version: int | None = None,
+) -> tuple[bool, int]:
+    """Desa la config a channel.meta['collab'] amb versionatge optimista.
+
+    Retorna ``(ok, new_version)``.
+    Si *expected_version* no és ``None`` i no coincideix amb la versió actual,
+    retorna ``(False, current_version)`` — el caller ha de rellegir i reintentar.
+    """
     async with get_async_db_context() as db:
         result = await db.execute(select(Channel).filter(Channel.id == channel_id))
         channel = result.scalars().first()
         if not channel:
-            return False
-        channel.meta = {**(channel.meta or {}), "collab": config.model_dump()}
+            return False, -1
+
+        current_version = channel.meta_version or 0
+        if expected_version is not None and current_version != expected_version:
+            return False, current_version  # conflicte detectat
+
+        new_meta = {**(channel.meta or {}), "collab": config.model_dump()}
+        new_version = current_version + 1
+
+        update_result = await db.execute(
+            update(Channel)
+            .where(
+                Channel.id == channel_id,
+                Channel.meta_version == current_version,
+            )
+            .values(meta=new_meta, meta_version=new_version)
+        )
+        if update_result.rowcount == 0:
+            await db.rollback()
+            result = await db.execute(
+                select(Channel.meta_version).filter(Channel.id == channel_id)
+            )
+            current = result.scalar_one_or_none()
+            return False, current if current is not None else -1
         await db.commit()
-        return True
+        return True, new_version
+
+
+async def get_meta_version(channel_id: str) -> int:
+    """Retorna la versió actual de meta d'un canal (per al versionatge optimista)."""
+    async with get_async_db_context() as db:
+        result = await db.execute(select(Channel.meta_version).filter(Channel.id == channel_id))
+        row = result.scalar_one_or_none()
+        return row or 0
 
 
 ############################

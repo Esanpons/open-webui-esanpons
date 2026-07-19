@@ -27,6 +27,7 @@
 
 	// [collab-fork] Panell de l'espai col·laboratiu (taula rodona d'IAs)
 	import CollabPanel from '../collab/CollabPanel.svelte';
+	import CollabAgentsBar from '../collab/CollabAgentsBar.svelte';
 
 	export let id = '';
 
@@ -392,6 +393,11 @@
 						{/key}
 					</div>
 				</div>
+
+				<!-- [collab-fork] barra d'agents en temps real (receipts W1/W9/W10) -->
+				{#key id}
+					<CollabAgentsBar channelId={id} />
+				{/key}
 
 				<div class=" pb-[1rem] px-2.5">
 					<MessageInput

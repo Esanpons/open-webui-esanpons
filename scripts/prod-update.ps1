@@ -1,15 +1,12 @@
 # update.ps1 - Posa la versio actual del repo a produccio, conservant les dades.
 #
-#   .\scripts\prod-update.ps1              compila, copia webui.db, instal-la i arrenca
-#   .\scripts\prod-update.ps1 -NoStart     igual, pero sense arrencar al final
+#   .\scripts\prod-update.ps1              compila, copia webui.db i instal-la
 #   .\scripts\prod-update.ps1 -WithDeps    a mes, actualitza les dependencies Python
 #                                    (cal si has tocat pyproject.toml)
 #
 # Les dades de D:\open-webui-production\data NO es toquen mai.
 
 param(
-    [int]$Port = 0,
-    [switch]$NoStart,
     [switch]$WithDeps   # usa'l si has afegit/canviat dependencies a pyproject.toml
 )
 
@@ -66,6 +63,8 @@ $wheel = Invoke-FrontendAndWheelBuild
 # Per defecte --no-deps: es MOLT mes rapid i les dependencies rarament canvien.
 # Si has tocat pyproject.toml, passa -WithDeps.
 
+Stop-OpenWebUI
+
 if ($WithDeps) {
     Install-Dependencies -WheelPath $wheel
 } else {
@@ -99,11 +98,7 @@ if ($backup) {
 }
 Write-Host "  Dades:    $DATA_DIR  (intactes)"
 Write-Host ''
-Write-Host '  Nota: si l''app ja estava arrencada, atura-la i torna-la a arrencar' -ForegroundColor DarkGray
-Write-Host "        ($PROD_ROOT\start.bat) perque agafi la versio nova." -ForegroundColor DarkGray
+Write-Host '  Nota: produccio s''atura abans d''instal-lar per evitar corrupcions de pip a Windows.' -ForegroundColor DarkGray
+Write-Host '        No s''arrenca automaticament. Per arrencar-la manualment:' -ForegroundColor DarkGray
+Write-Host "        $PROD_ROOT\start.bat" -ForegroundColor White
 Write-Host ''
-
-if (-not $NoStart) {
-    $p = if ($Port -gt 0) { $Port } else { $DEFAULT_PORT }
-    Start-OpenWebUI -Port $p
-}
