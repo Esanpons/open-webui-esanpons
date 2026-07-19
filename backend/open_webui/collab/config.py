@@ -77,6 +77,26 @@ class CollabConfig(BaseModel):
         value = self.guardrails.get(key, GUARDRAIL_DEFAULTS.get(key))
         return value
 
+    def context_messages(self, *, handraise: bool = False) -> int:
+        """Nombre de missatges recents a passar com a context, amb semàntica
+        única per a 0.
+
+        A diferència dels timeouts (on 0 = «sense límit»), aquí 0/absent vol dir
+        «fes servir el default» (mai desactivar del tot el context). Abans,
+        `int(guardrail("context_messages") or 30)` feia que 0 dupliqués el
+        context a 30 — contradient la doc i sorprenent l'usuari.
+
+        Amb ``handraise=True`` retorna el context (més curt) de la mà alçada:
+        min(context general, handraise_context_messages), o el general si el de
+        mà alçada és 0/absent.
+        """
+        default = GUARDRAIL_DEFAULTS["context_messages"]
+        general = int(self.guardrail("context_messages") or default)
+        if not handraise:
+            return general
+        hr = int(self.guardrail("handraise_context_messages") or 0)
+        return min(general, hr) if hr else general
+
     def summary(self) -> str:
         lines = [
             f"**Estat:** {'✅ actiu' if self.enabled else '⏸️ inactiu'}",
@@ -193,6 +213,26 @@ def allowed_project_roots() -> list[str]:
     return [r.strip() for r in raw.split(";") if r.strip()]
 
 
+def local_mode() -> bool:
+    """Mode LOCAL: el backend i l'escriptori són a la mateixa màquina (l'ús
+    d'aquest fork). Habilita primitives lligades al host —navegar tot el disc
+    sense whitelist, obrir VS Code— que en un desplegament remot serien un risc.
+
+    Actiu si COLLAB_LOCAL_MODE és cert, o —per compatibilitat amb instal·lacions
+    existents— si NO hi ha COLLAB_ALLOWED_ROOTS definit (comportament històric:
+    sense whitelist s'assumia local). Definir COLLAB_ALLOWED_ROOTS i deixar
+    COLLAB_LOCAL_MODE sense activar és la manera d'endurir un desplegament
+    compartit.
+    """
+    raw = os.environ.get("COLLAB_LOCAL_MODE", "").strip().lower()
+    if raw in ("1", "true", "yes"):
+        return True
+    if raw in ("0", "false", "no"):
+        return False
+    # Sense valor explícit: local si no hi ha whitelist (compat històric).
+    return not allowed_project_roots()
+
+
 def validate_project_dir(path: str, is_admin: bool) -> tuple[bool, str]:
     """Retorna (ok, motiu). El path ha d'existir i, si hi ha llista blanca,
     penjar d'una de les arrels permeses."""
@@ -214,6 +254,14 @@ def validate_project_dir(path: str, is_admin: bool) -> tuple[bool, str]:
             + ", ".join(f"`{r}`" for r in roots)
         )
 
+    # Sense whitelist, fixar una carpeta arbitrària del host només s'accepta en
+    # mode local i per un admin. En un desplegament compartit s'ha d'exigir
+    # COLLAB_ALLOWED_ROOTS.
+    if not local_mode():
+        return False, (
+            "Sense COLLAB_ALLOWED_ROOTS definit, triar carpeta només es permet en "
+            "mode local (COLLAB_LOCAL_MODE). Defineix una llista d'arrels permeses."
+        )
     if not is_admin:
         return False, "Sense COLLAB_ALLOWED_ROOTS definit, només un admin pot triar carpeta."
     return True, normalized

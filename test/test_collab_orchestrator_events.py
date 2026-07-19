@@ -54,7 +54,7 @@ def test_emit_collab_event_uses_channel_envelope(monkeypatch):
 
 def test_handraise_orders_by_priority_and_configuration(monkeypatch):
     async def scenario():
-        async def fake_completion(_request, _user, _channel, _config, agent_id, *_args):
+        async def fake_completion(_request, _user, _channel, _config, agent_id, *_args, **_kwargs):
             priority = {"a1": 5, "a2": 2}[agent_id]
             return f'{{"intervene": true, "priority": {priority}, "reason": "ok"}}'
 
@@ -105,7 +105,7 @@ def test_handraise_skips_last_speaker_and_closes_receipt(monkeypatch):
     async def scenario():
         calls = []
 
-        async def fake_completion(_request, _user, _channel, _config, agent_id, *_args):
+        async def fake_completion(_request, _user, _channel, _config, agent_id, *_args, **_kwargs):
             calls.append(agent_id)
             return '{"intervene": false, "priority": 3, "reason": ""}'
 
@@ -196,6 +196,7 @@ def test_roundrobin_runs_each_agent_once_and_releases_lease(monkeypatch):
         monkeypatch.setattr(orchestrator, "acquire_lease", acquire)
         monkeypatch.setattr(orchestrator, "release_lease", release)
         monkeypatch.setattr(orchestrator, "_renew_round_lease", hold_lease)
+        monkeypatch.setattr(orchestrator, "cleanup_orphan_turn_messages", no_op)
         monkeypatch.setattr(orchestrator.Channels, "get_channel_by_id", get_channel)
         monkeypatch.setattr(orchestrator, "get_collab_config", lambda _channel: config)
         monkeypatch.setattr(orchestrator, "clear_end_proposal", no_op)
@@ -209,10 +210,15 @@ def test_roundrobin_runs_each_agent_once_and_releases_lease(monkeypatch):
         await orchestrator.run_round(None, channel, None, event_seq=1)
 
         assert turns == ["a1", "a2", "a3"]
+        # Cada agent: will_intervene (abans del torn) i incorporated (després,
+        # ha respost incorporant el context del missatge humà — MR-26).
         assert transitions == [
             ("a1", "will_intervene"),
+            ("a1", "incorporated"),
             ("a2", "will_intervene"),
+            ("a2", "incorporated"),
             ("a3", "will_intervene"),
+            ("a3", "incorporated"),
         ]
         assert len(releases) == 1
         assert releases[0][0] == "c1"
@@ -274,6 +280,7 @@ def test_continuous_mode_restarts_queue_for_new_user_event_between_turns(monkeyp
         monkeypatch.setattr(orchestrator, "acquire_lease", acquire)
         monkeypatch.setattr(orchestrator, "release_lease", release)
         monkeypatch.setattr(orchestrator, "_renew_round_lease", hold_lease)
+        monkeypatch.setattr(orchestrator, "cleanup_orphan_turn_messages", no_op)
         monkeypatch.setattr(orchestrator.Channels, "get_channel_by_id", get_channel)
         monkeypatch.setattr(orchestrator, "get_collab_config", lambda _channel: config)
         monkeypatch.setattr(orchestrator, "clear_end_proposal", no_op)
@@ -288,10 +295,15 @@ def test_continuous_mode_restarts_queue_for_new_user_event_between_turns(monkeyp
         await orchestrator.run_round(None, channel, None, event_seq=1)
 
         assert turns == ["a1", "a1", "a2"]
+        # will_intervene abans de cada torn + incorporated després (MR-26).
+        # El seq salta d'1 a 2 quan arriba el missatge humà nou entre torns.
         assert transitions == [
             (1, "a1", "will_intervene"),
+            (1, "a1", "incorporated"),
             (2, "a1", "will_intervene"),
+            (2, "a1", "incorporated"),
             (2, "a2", "will_intervene"),
+            (2, "a2", "incorporated"),
         ]
 
     asyncio.run(scenario())
@@ -801,7 +813,7 @@ def test_t11_profile_priority_affects_handraise_order(monkeypatch):
                 ]
             }
 
-        async def fake_completion(_request, _user, _channel, _config, agent_id, *_args):
+        async def fake_completion(_request, _user, _channel, _config, agent_id, *_args, **_kwargs):
             return '{"intervene": true, "priority": 5, "reason": "ok"}'
 
         async def empty_text(*_args):

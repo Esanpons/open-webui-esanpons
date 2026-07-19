@@ -8,7 +8,7 @@
 	// (identitats W14) i la icona d'estat; amb equips grans cau al resum
 	// compacte per estats.
 	import { models } from '$lib/stores';
-	import { collabReceiptRounds } from '$lib/stores/collab';
+	import { collabReceiptRounds, COLLAB_STATE_INFO } from '$lib/stores/collab';
 	import type { CollabAgentIdentity } from '$lib/apis/collab';
 
 	export let channelId: string;
@@ -17,21 +17,14 @@
 
 	const MAX_DETAILED_AGENTS = 6;
 
-	const STATE_ICONS: Record<string, string> = {
-		received: '📨',
-		incorporated: '📥',
-		evaluating: '🤔',
-		will_intervene: '✋',
-		pass: '💤'
-	};
-
-	const STATE_LABELS: Record<string, string> = {
-		received: 'ha rebut el missatge',
-		incorporated: 'ha incorporat el context',
-		evaluating: 'està valorant si intervé',
-		will_intervene: 'intervindrà',
-		pass: 'passa aquest torn'
-	};
+	// Font única de veritat dels estats (vegeu stores/collab.ts): derivem els
+	// mapes icona/etiqueta d'aquí perquè no divergeixin de la barra d'agents.
+	const STATE_ICONS: Record<string, string> = Object.fromEntries(
+		Object.entries(COLLAB_STATE_INFO).map(([k, v]) => [k, v.icon])
+	);
+	const STATE_LABELS: Record<string, string> = Object.fromEntries(
+		Object.entries(COLLAB_STATE_INFO).map(([k, v]) => [k, v.label])
+	);
 
 	const modelName = (id: string) => $models.find((m) => m.id === id)?.name ?? id;
 	const agentName = (id: string) => identities[id]?.name ?? modelName(id);

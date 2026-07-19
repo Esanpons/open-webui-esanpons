@@ -2,9 +2,33 @@
 // Vegeu docs/plans/espai-collaboratiu.md i backend/open_webui/collab/.
 import { WEBUI_API_BASE_URL } from '$lib/constants';
 
-const request = async (token: string, path: string, options: RequestInit = {}) => {
-	let error = null;
+// Error tipat que conserva el codi HTTP: així el frontend pot detectar un 409
+// (conflicte de versió) per `status`, no pel text del missatge en català —que
+// era fràgil davant de qualsevol canvi de redacció o traducció.
+export class CollabApiError extends Error {
+	status: number;
+	detail: unknown;
+	constructor(status: number, detail: unknown) {
+		// Missatge llegible per als toasts `${e}`: string directe, array de
+		// FastAPI (422) o objecte serialitzat en comptes de [object Object].
+		let message: string;
+		if (typeof detail === 'string' && detail) {
+			message = detail;
+		} else if (Array.isArray(detail)) {
+			message = detail.map((d) => d?.msg ?? JSON.stringify(d)).join('; ');
+		} else if (detail) {
+			message = JSON.stringify(detail);
+		} else {
+			message = `Error HTTP ${status}`;
+		}
+		super(message);
+		this.name = 'CollabApiError';
+		this.status = status;
+		this.detail = detail;
+	}
+}
 
+const request = async (token: string, path: string, options: RequestInit = {}) => {
 	const res = await fetch(`${WEBUI_API_BASE_URL}/collab${path}`, {
 		headers: {
 			Accept: 'application/json',
@@ -12,22 +36,24 @@ const request = async (token: string, path: string, options: RequestInit = {}) =
 			authorization: `Bearer ${token}`
 		},
 		...options
-	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
-		.catch((err) => {
-			error = err.detail ?? err;
-			console.error('collab api error', path, err);
-			return null;
-		});
+	});
 
-	if (error) {
-		throw error;
+	if (!res.ok) {
+		// El cos d'error pot no ser JSON (p. ex. un 500 amb HTML); no deixem
+		// que un SyntaxError de res.json() emmascari el codi real.
+		let detail: unknown = null;
+		try {
+			const body = await res.json();
+			detail = body?.detail ?? body;
+		} catch {
+			detail = `Error HTTP ${res.status}`;
+		}
+		const err = new CollabApiError(res.status, detail);
+		console.error('collab api error', path, res.status, detail);
+		throw err;
 	}
 
-	return res;
+	return res.json();
 };
 
 export type CollabConfig = {

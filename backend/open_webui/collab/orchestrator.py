@@ -64,12 +64,12 @@ from open_webui.collab.usage import (
 
 # W7 — mòduls extrets
 from open_webui.collab.turns import (
-    _HARD_TURN_TIMEOUT,
     _effective_turn_timeout,
     _mark_cancelled_message,
     _turn_cancellables,
     active_turn_id,
     cancel_turn,
+    cleanup_orphan_turn_messages,
     lock_turn_tool,
     unlock_turn_tool,
 )
@@ -87,6 +87,7 @@ from open_webui.collab.context import (
     _participants_line,
     _project_block,
     build_transcript,
+    project_tree_text,
 )
 from open_webui.collab.agents_status import (
     _RETRY_DOWN_SECONDS,
@@ -116,14 +117,41 @@ _PRIORITY_RE = re.compile(r'"priority"\s*:\s*(\d+)')
 # Marcadors de text per a les propostes de consens — funcionen amb QUALSEVOL
 # model, també els pipes CLI que no fan tool-calling (l'eina propose_finish és
 # l'alternativa per als models amb tools natius).
-_FINISH_MARKER_RE = re.compile(r"FEINA_ACABADA\s*:?\s*(.*)", re.DOTALL)
-_PLAN_MARKER_RE = re.compile(r"PLA_ACORDAT\s*:?\s*(.*)", re.DOTALL)
+#
+# Ancorats a INICI DE LÍNIA (MULTILINE): el prompt demana que el missatge
+# ACABI amb el marcador, així que només el compta si obre una línia. Sense
+# l'àncora, citar-lo enmig d'una frase ("recordeu escriure FEINA_ACABADA:")
+# disparava una proposta de tancament espúria. Mateix problema que ja es va
+# corregir amb la detecció d'errors (vegeu agents_status.py).
+_FINISH_MARKER_RE = re.compile(r"^\s*FEINA_ACABADA\s*:?\s*(.*)", re.DOTALL | re.MULTILINE)
+_PLAN_MARKER_RE = re.compile(r"^\s*PLA_ACORDAT\s*:?\s*(.*)", re.DOTALL | re.MULTILINE)
 _WAIT_USER_MARKER = "ESPEREM_USUARI"
 
 # Errors consecutius de mà alçada abans de declarar l'agent caigut (in-memory).
 _handraise_failures: dict[tuple[str, str], int] = {}
 _budget_notices: dict[str, str] = {}
-_models_without_collab_tools: set[str] = set()
+# model_id -> timestamp en què es va detectar que no admet tool calling. Amb TTL
+# perquè un model que guanyi suport de tools (canvi de proveïdor/versió) es
+# torni a provar en lloc de quedar vetat fins a reiniciar el procés.
+_models_without_collab_tools: dict[str, float] = {}
+_TOOLS_UNSUPPORTED_TTL = 3600  # 1h
+
+
+def _model_lacks_tools(model_id: str) -> bool:
+    """El model està marcat com a sense suport de tools i encara dins del TTL?"""
+    ts = _models_without_collab_tools.get(model_id)
+    if ts is None:
+        return False
+    if time.time() - ts > _TOOLS_UNSUPPORTED_TTL:
+        _models_without_collab_tools.pop(model_id, None)
+        return False
+    return True
+
+# Sentinella retornat per _quick_completion quan la crida NO s'ha fet perquè el
+# pressupost la bloqueja (estat administratiu), a diferència d'un None que
+# significa "ha fallat". Handraise el tracta com a "pass", no com a "error":
+# així un agent sa amb pressupost exhaurit no es marca com a caigut.
+BUDGET_BLOCKED = object()
 
 # Les crides auxiliars han de ser realment curtes. Sense max_tokens alguns
 # proveïdors reserven milers de tokens de sortida per un JSON de tres camps i
@@ -136,6 +164,11 @@ _QUICK_TASK_MAX_TOKENS = {
     "vote": 1024,
     "summary": 1200,
 }
+# Sostre de sanitat del poll de generació (segons sense cap progrés de contingut)
+# INDEPENDENT del guardrail turn_timeout: evita que un pipe mort deixi el bucle
+# girant per sempre retenint el slot de backpressure quan turn_timeout=0.
+_STALLED_GENERATION_TIMEOUT = 300
+
 _RETRY_AFTER_RE = re.compile(
     r"(?:please\s+try\s+again\s+in|retry\s+after)\s+([0-9]+(?:\.[0-9]+)?)\s*s",
     re.IGNORECASE,
@@ -396,11 +429,29 @@ async def _run_generation_until_done(request, form_data, user, message_id: str):
                 meta={**(message.meta or {}), "done": True},
             ),
         )
+    # Sostre de sanitat: fins i tot amb turn_timeout=0 (sense timeout de torn),
+    # aquest bucle no pot girar per sempre si el pipeline mor sense marcar
+    # `done`. Es talla si el contingut no progressa durant massa temps; qualsevol
+    # canvi (delta de streaming) reinicia el rellotge, així que un torn lent que
+    # va escrivint no es veu afectat.
+    last_content = None
+    last_progress = time.monotonic()
     while True:
         message = await Messages.get_message_by_id(message_id)
         if not message or (message.meta or {}).get("done"):
             persisted = message.content if message else None
             return persisted if persisted and persisted.strip() else (direct_content or persisted)
+        current = message.content or ""
+        if current != last_content:
+            last_content = current
+            last_progress = time.monotonic()
+        elif time.monotonic() - last_progress > _STALLED_GENERATION_TIMEOUT:
+            log.warning(
+                "Generació encallada (%ss sense progrés) al missatge %s; s'abandona el poll",
+                _STALLED_GENERATION_TIMEOUT,
+                message_id,
+            )
+            return current.strip() or direct_content or current
         await asyncio.sleep(1.5)
 
 
@@ -605,10 +656,34 @@ async def _emit_turn_event(
 
 
 async def _renew_round_lease(channel_id: str, owner: str, state: dict):
-    """Manté el lease viu; si es perd, demana una sortida neta de la ronda."""
+    """Manté el lease viu; si es perd, demana una sortida neta de la ronda.
+
+    Un error transitori de BD no ha de matar aquesta tasca en silenci (deixaria
+    la ronda viva sense renovar el lease → un altre worker podria adquirir-lo i
+    executar una segona ronda al mateix canal). Es tolera un nombre limitat
+    d'errors consecutius abans de declarar el lease perdut.
+    """
+    consecutive_errors = 0
     while not state["stop"]:
         await asyncio.sleep(10)
-        if not await renew_lease(channel_id, owner):
+        try:
+            renewed = await renew_lease(channel_id, owner)
+            consecutive_errors = 0
+        except Exception:
+            consecutive_errors += 1
+            log.warning(
+                "Error renovant el lease del canal %s (%d consecutius)",
+                channel_id,
+                consecutive_errors,
+                exc_info=True,
+            )
+            # Amb TTL 30s i renovació cada 10s, tolerem 2 errors (20s) i encara
+            # queda marge; al tercer donem el lease per perdut.
+            if consecutive_errors < 3:
+                continue
+            renewed = False
+
+        if not renewed:
             log.error("S'ha perdut el lease persistent del canal %s", channel_id)
             state["lease_lost"] = True
             state["stop"] = True
@@ -650,10 +725,16 @@ async def _get_models(request, user) -> dict:
 
 
 async def _quick_completion(
-    request, user, channel, config: CollabConfig, agent_id: str, system: str, prompt: str, task: str
-) -> Optional[str]:
+    request, user, channel, config: CollabConfig, agent_id: str, system: str, prompt: str, task: str,
+    *, budget_sentinel: bool = False,
+):
     """Crida curta no-streaming a un agent (mà alçada, vot, resum). Retorna el
-    contingut de la resposta o None si falla o supera el handraise_timeout."""
+    contingut de la resposta o None si falla o supera el handraise_timeout.
+
+    Amb ``budget_sentinel=True`` retorna ``BUDGET_BLOCKED`` (en comptes de None)
+    quan la crida no s'ha fet perquè el pressupost la bloqueja, perquè el caller
+    ho pugui distingir d'una fallada real. La resta de callers (vot, resum)
+    reben None i ho tracten com "sense resposta"."""
     from open_webui.utils.chat import generate_chat_completion
 
     if not await _circuit_allows(channel.id, agent_id):
@@ -664,7 +745,7 @@ async def _quick_completion(
         request, channel, user, agent_id, task, resolved
     )
     if effective_model_id is None:
-        return None
+        return BUDGET_BLOCKED if budget_sentinel else None
     resolved_name = _agent_display_name(resolved, None, agent_id)
     system = _apply_agent_prompt(system, resolved, resolved_name)
     turn_id = str(uuid.uuid4())
@@ -801,7 +882,14 @@ async def _handraise_one(
         '{"intervene": true|false, "priority": 1-5, "reason": "màxim una frase"}'
     )
 
-    content = await _quick_completion(request, user, channel, config, agent_id, system, prompt, "handraise")
+    content = await _quick_completion(
+        request, user, channel, config, agent_id, system, prompt, "handraise",
+        budget_sentinel=True,
+    )
+    if content is BUDGET_BLOCKED:
+        # Pressupost exhaurit: no és una fallada de l'agent. Es tracta com un
+        # "pass" (no intervé) i no compta per marcar-lo caigut.
+        return ("budget", None)
     if content is None:
         return ("error", None)
 
@@ -849,22 +937,12 @@ async def handraise(
     el consens ("ningú vol parlar") d'una fallada de tots els agents."""
     budget = await _channel_budget(channel.id)
     degraded = await _is_degraded(channel.id, budget)
-    context_config = config
-    handraise_context = int(config.guardrail("handraise_context_messages") or 0)
-    general_context = int(config.guardrail("context_messages") or 30)
-    if degraded:
-        context_config = config.model_copy(
-            update={"guardrails": {**config.guardrails, "context_messages": 5}}
-        )
-    elif handraise_context:
-        context_config = config.model_copy(
-            update={
-                "guardrails": {
-                    **config.guardrails,
-                    "context_messages": min(general_context, handraise_context),
-                }
-            }
-        )
+    # Context (curt) per a la mà alçada: degradat → 5; si no, el de la mà alçada
+    # (config.context_messages(handraise=True) ja aplica la semàntica de 0).
+    hr_context = 5 if degraded else config.context_messages(handraise=True)
+    context_config = config.model_copy(
+        update={"guardrails": {**config.guardrails, "context_messages": hr_context}}
+    )
     transcript = await build_transcript(channel.id, context_config, models)
     board = await _board_text(channel.id)
     phase = await _current_phase(channel.id, config)
@@ -888,7 +966,7 @@ async def handraise(
         for agent_id in candidates:
             await _transition_receipt(channel.id, event_seq, agent_id, "evaluating")
 
-    results = await asyncio.gather(
+    raw_results = await asyncio.gather(
         *[
             _handraise_one(
                 request,
@@ -902,8 +980,23 @@ async def handraise(
                 phase,
             )
             for agent_id in candidates
-        ]
+        ],
+        return_exceptions=True,
     )
+    # Una excepció inesperada en una mà alçada no ha de tombar tota la ronda (i
+    # amb gather normal, deixaria les altres corrutines sense observar): es
+    # tracta com un "error" del seu agent.
+    results = []
+    for agent_id, res in zip(candidates, raw_results):
+        if isinstance(res, BaseException):
+            log.warning(
+                "Mà alçada de %s ha llançat una excepció inesperada",
+                agent_id,
+                exc_info=res,
+            )
+            results.append(("error", None))
+        else:
+            results.append(res)
 
     # Comptabilitat de caiguts: 2 errors seguits de mà alçada → caigut; una
     # resposta vàlida → recuperat.
@@ -988,6 +1081,11 @@ async def agent_turn(
     transcript = await build_transcript(channel.id, context_config, models)
     board = await _board_text(channel.id)
     phase = await _current_phase(channel.id, config)
+    # Arbre de fitxers precalculat fora del loop (I/O de disc); només si no
+    # estem en mode degradat (que l'omet per estalviar tokens).
+    tree_text = None
+    if config.project_dir and not degraded:
+        tree_text = await asyncio.to_thread(project_tree_text, config)
 
     # Placeholder amb "treballant" perquè els agents lents sense streaming
     # (p.ex. Codex, que ho retorna tot al final) no semblin morts.
@@ -1019,7 +1117,7 @@ async def agent_turn(
             "antiga (o l'usuari t'ho demana), usa `read_conversation(offset, limit)` o "
             "`search_conversation(query)`."
             + _phase_block(phase)
-            + _project_block(config, include_tree=include_tree)
+            + _project_block(config, include_tree=include_tree, tree_text=tree_text)
             + board
         )
         system = _apply_agent_prompt(system, resolved, name)
@@ -1060,7 +1158,7 @@ async def agent_turn(
     # foto de la carpeta per detectar canvis.
     files_before = None
     if (
-        effective_model_id not in _models_without_collab_tools
+        not _model_lacks_tools(effective_model_id)
         and await ensure_collab_tool(user.id)
     ):
         form_data["tool_ids"] = [COLLAB_TOOL_ID]
@@ -1074,7 +1172,8 @@ async def agent_turn(
     if resolved.get("effort") and _model_supports_effort(effective_model):
         form_data["reasoning_effort"] = resolved["effort"]
     if config.project_dir:
-        files_before = snapshot(config.project_dir)
+        # snapshot() pot fer milers de stat() en carpetes grans: fora del loop.
+        files_before = await asyncio.to_thread(snapshot, config.project_dir)
 
     async def _run_with_backpressure():
         async with acquire_model_slot(effective_model_id):
@@ -1109,7 +1208,7 @@ async def agent_turn(
 
             retry_form = dict(form_data)
             if tools_unsupported:
-                _models_without_collab_tools.add(effective_model_id)
+                _models_without_collab_tools[effective_model_id] = time.time()
                 retry_form.pop("tool_ids", None)
                 log.warning(
                     "El model %s no admet tool calling; es repeteix el torn sense eines",
@@ -1234,7 +1333,8 @@ async def agent_turn(
     # del torn i avís 🗂️ al canal amb els fitxers tocats.
     if files_before is not None:
         try:
-            changes = diff_snapshots(files_before, snapshot(config.project_dir))
+            files_after = await asyncio.to_thread(snapshot, config.project_dir)
+            changes = diff_snapshots(files_before, files_after)
             notice = format_changes(name, changes)
             if notice:
                 await post_notice(request, channel, user, notice)
@@ -1294,11 +1394,19 @@ async def agent_turn(
         plan_match = _PLAN_MARKER_RE.search(final_content)
         if finish_match:
             await set_end_proposal(
-                channel.id, name, finish_match.group(1).strip() or "(sense resum)", kind="finish"
+                channel.id,
+                name,
+                finish_match.group(1).strip() or "(sense resum)",
+                kind="finish",
+                by_id=agent_id,
             )
         elif plan_match and phase == "planning":
             await set_end_proposal(
-                channel.id, name, plan_match.group(1).strip() or "(sense detall)", kind="plan"
+                channel.id,
+                name,
+                plan_match.group(1).strip() or "(sense detall)",
+                kind="plan",
+                by_id=agent_id,
             )
 
     return final_content
@@ -1322,6 +1430,11 @@ async def run_round(request, channel, user, *, event_seq: int | None = None):
     state = {"stop": False, "lease_lost": False}
     _active_rounds[channel.id] = state
     lease_task = asyncio.create_task(_renew_round_lease(channel.id, lease_owner, state))
+    # Netegem placeholders de torn orfes d'una ronda anterior interrompuda
+    # (crash/reinici): la UI mostraria un agent "parlant" per sempre. Acabem
+    # d'adquirir el lease, així que no hi ha cap torn viu d'aquest canal.
+    with suppress(Exception):
+        await cleanup_orphan_turn_messages(channel.id)
     try:
         turns = 0
         quick_calls = 0
@@ -1331,6 +1444,9 @@ async def run_round(request, channel, user, *, event_seq: int | None = None):
         last_speaker: Optional[str] = None
         roundrobin_queue: Optional[list[str]] = None
         pending_event_seq = event_seq
+        # Últim missatge humà vigent (per marcar receipts com a "incorporated"
+        # quan un agent efectivament respon incorporant aquest context).
+        active_user_seq = event_seq
         scheduler_event_cursor = event_seq or 0
         config = None
         models: dict = {}
@@ -1373,6 +1489,7 @@ async def run_round(request, channel, user, *, event_seq: int | None = None):
             )
             if latest_user_seq is not None:
                 pending_event_seq = latest_user_seq
+                active_user_seq = latest_user_seq
                 if config.conversation_mode == "continuous":
                     # Una cua round-robin anterior ja no representa el context
                     # vigent; es reconstrueix per al missatge humà nou.
@@ -1510,6 +1627,14 @@ async def run_round(request, channel, user, *, event_seq: int | None = None):
             last_speaker = speaker
             turns += 1
 
+            # W9: qui ha parlat efectivament ha INCORPORAT el context del darrer
+            # missatge humà (l'ha llegit i hi ha respost). Marca el seu receipt.
+            if active_user_seq is not None and final_content and final_content.strip():
+                with suppress(Exception):
+                    await _transition_receipt(
+                        channel.id, active_user_seq, speaker, "incorporated"
+                    )
+
             # L'agent declara que l'equip espera l'usuari: repòs net, sense
             # empentes ni tancaments prematurs.
             if final_content and _WAIT_USER_MARKER in final_content:
@@ -1587,10 +1712,31 @@ async def run_round(request, channel, user, *, event_seq: int | None = None):
                     log.exception("No s'ha pogut actualitzar el resum de %s", channel.id)
     except Exception:
         log.exception("La ronda del canal %s ha petat", channel.id)
+        # A diferència dels ~10 camins d'error controlats, un crash intern
+        # deixava el canal mut sense cap senyal. Avisem (best-effort) perquè
+        # l'usuari sàpiga que ha d'escriure per reactivar l'equip.
+        with suppress(Exception):
+            await post_notice(
+                request,
+                channel,
+                user,
+                "💥 La ronda s'ha aturat per un error intern. Escriu un missatge "
+                "per reintentar-ho; si persisteix, revisa els logs del backend.",
+            )
     finally:
         _active_rounds.pop(channel.id, None)
+        # Neteja de l'estat en memòria d'aquest canal perquè els dicts de mòdul
+        # no creixin sense fita al llarg de la vida del procés.
+        _budget_notices.pop(channel.id, None)
+        for key in [k for k in _handraise_failures if k[0] == channel.id]:
+            _handraise_failures.pop(key, None)
         lease_task.cancel()
-        with suppress(asyncio.CancelledError):
+        # Suprimim QUALSEVOL excepció de la tasca de renovació (no només
+        # CancelledError): si ha mort amb un error de BD, rellançar-lo aquí
+        # saltaria el release_lease de sota i deixaria el canal bloquejat fins
+        # que expirés el TTL. CancelledError hereta de BaseException (no
+        # d'Exception), així que cal suprimir-la explícitament.
+        with suppress(asyncio.CancelledError, Exception):
             await lease_task
         try:
             await release_lease(

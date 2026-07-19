@@ -48,7 +48,7 @@ frontend) i els 14 tests nous cobrint les 9 specs W5/W15 pendents + les specs T8
    Groq i un model local després de reiniciar el backend, conservant l'error real.
 
 **Resultats verificats:**
-- Backend: 18 mòduls col·laboratius, **200+ proves en verd**.
+- Backend: 21 mòduls col·laboratius, **247 proves en verd**.
 - Frontend: build de producció verd, accessibilitat W6 corregida (ARIA, focus, teclat).
 - Refactor W7: orchestrator.py modularitzat en 5 mòduls nous sense canvis de lògica.
 - Migracions Alembic: 6 migracions lineals reversibles.
@@ -174,7 +174,7 @@ quick completion, hand-raising, agent_turn i run_round.
 
 ## Unitats ja verificades
 
-- **Backend col·laboratiu:** **200+ proves verdes**, incloses les proves del
+- **Backend col·laboratiu:** **247 proves verdes** (verificat), incloses les proves del
   timeout propagat als pipes CLI, proves de perfils i propagació de plantilles,
   proves de normalització de respostes de proveïdors, a
   `test_collab_engine.py`, `test_collab_orchestrator_events.py`,
@@ -200,7 +200,7 @@ quick completion, hand-raising, agent_turn i run_round.
 backend/open_webui/collab/
 ├── config.py          # Config de l'espai + validació de carpetes
 ├── engine.py          # Persistència: sessions, events, receipts, state, tasks
-├── orchestrator.py    # Coordinador (orquestració pura, ~640 línies)
+├── orchestrator.py    # Coordinador (orquestració de rondes/torns, ~1750 línies)
 ├── turns.py           # Gestió de torns i cancel·lació (W7 Pas 1)
 ├── prompts.py         # Filosofia i construcció de prompts (W7 Pas 2)
 ├── context.py         # Context del canal: transcript, board, projecte (W7 Pas 3)

@@ -22,6 +22,7 @@
 		stopCollabRound,
 		updateCollabConfig,
 		updateCollabTask,
+		CollabApiError,
 		type CollabConfig,
 		type CollabTask
 	} from '$lib/apis/collab';
@@ -38,6 +39,7 @@
 	let config: CollabConfig | null = null;
 	let loading = true;
 	let saving = false;
+	let loadError: string | null = null;
 
 	// agents
 	let selectedModelToAdd = '';
@@ -179,15 +181,25 @@
 	const loadConfig = async () => {
 		try {
 			config = await getCollabConfig(localStorage.token, channelId);
+			loadError = null;
 			guardrailDraft = {};
 			for (const [key, def] of Object.entries(config?.guardrail_defaults ?? {})) {
 				const value = config?.guardrails?.[key] ?? def;
 				guardrailDraft[key] = String(value);
 			}
 		} catch (e) {
-			toast.error(`${e}`);
+			// No deixem un panell buit sense explicació: guardem l'error per
+			// mostrar un estat amb botó de reintent (vegeu la branca {:else}).
+			loadError = `${e}`;
+			toast.error(loadError);
 		}
 		loading = false;
+	};
+
+	const retryLoad = async () => {
+		loading = true;
+		loadError = null;
+		await loadConfig();
 	};
 
 	const loadFiles = async () => {
@@ -252,12 +264,12 @@
 			config = { ...config, ...(await updateCollabConfig(localStorage.token, channelId, partial, version)) };
 			await loadFiles();
 		} catch (e) {
-			const msg = `${e}`;
-			if (msg.includes('canviat') || msg.includes('Refresca')) {
+			if (e instanceof CollabApiError && e.status === 409) {
 				// W4-7: 409 Conflict — un altre procés ha desat config mentrestant.
+				// Es detecta pel codi HTTP, no pel text del missatge.
 				toast.message('⚠️ Config modificada per un altre procés. Refrescant…');
 			} else {
-				toast.error(msg);
+				toast.error(`${e}`);
 			}
 			await loadConfig();
 		}
@@ -415,7 +427,20 @@
 	});
 </script>
 
-<div class="h-full w-full flex flex-col bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-100">
+<!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
+<div
+	class="h-full w-full flex flex-col bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-100"
+	role="dialog"
+	aria-label="Panell de la taula rodona"
+	tabindex="-1"
+	use:focusOnMount
+	on:keydown={(e) => {
+		if (e.key === 'Escape') {
+			e.stopPropagation();
+			onClose();
+		}
+	}}
+>
 	<!-- Capçalera -->
 	<div
 		class="flex items-center justify-between px-4 py-3 border-b border-gray-100 dark:border-gray-850"
@@ -850,6 +875,22 @@
 					</div>
 				</CollabSection>
 			{/if}
+		</div>
+	{:else}
+		<!-- Ni carregant ni amb config: la càrrega ha fallat (permisos, backend
+		     caigut…). Estat explícit amb reintent en comptes d'un panell buit. -->
+		<div class="flex-1 flex flex-col items-center justify-center gap-3 p-6 text-center text-sm">
+			<p class="text-gray-500">No s'ha pogut carregar la configuració de l'espai.</p>
+			{#if loadError}
+				<p class="text-xs text-red-500 break-words max-w-full">{loadError}</p>
+			{/if}
+			<button
+				type="button"
+				class="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700"
+				on:click={retryLoad}
+			>
+				🔄 Reintenta
+			</button>
 		</div>
 	{/if}
 

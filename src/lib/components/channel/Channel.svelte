@@ -345,6 +345,8 @@
 			<button
 				class="absolute top-12 right-4 z-20 size-9 rounded-full bg-white dark:bg-gray-850 shadow-md border border-gray-100 dark:border-gray-800 hover:scale-105 transition text-base"
 				title="Taula rodona (espai col·laboratiu)"
+				aria-label="Obre el panell de la taula rodona"
+				aria-pressed={showCollabPanel}
 				on:click={() => (showCollabPanel = !showCollabPanel)}
 			>
 				🤝

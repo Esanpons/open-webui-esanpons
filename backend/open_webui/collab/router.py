@@ -24,6 +24,7 @@ from open_webui.collab.config import (
     allowed_project_roots,
     get_collab_config,
     get_recent_dirs,
+    local_mode,
     push_recent_dir,
     save_collab_config,
     validate_project_dir,
@@ -84,6 +85,26 @@ def _check_can_manage(user):
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Només un admin pot gestionar espais col·laboratius (COLLAB_ADMIN_ONLY actiu)",
         )
+
+
+def _require_channel_manager(channel, user):
+    """Exigeix gestió EXPLÍCITA (admin o propietari del canal) per a operacions
+    sensibles —fixar project_dir, obrir VS Code— amb independència de
+    COLLAB_ADMIN_ONLY.
+
+    En un canal públic amb escriptura pública, `channel_has_access(strict=False)`
+    concedeix escriptura a qualsevol usuari verificat; això no ha de permetre
+    triar una carpeta del host ni arrencar processos. Aquestes operacions
+    requereixen ser admin o el propietari (channel.user_id).
+    """
+    if user.role == "admin":
+        return
+    if getattr(channel, "user_id", None) and channel.user_id == user.id:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Aquesta operació requereix ser admin o propietari del canal.",
+    )
 
 
 async def _get_channel_checked(request: Request, channel_id: str, user, permission: str = "read"):
@@ -217,6 +238,12 @@ async def import_profile(data: dict, user=Depends(get_verified_user)):
     ok, error, form = validate_imported_profile(data)
     if not ok:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error)
+    # Un perfil importat no pot fixar una carpeta que el panell rebutjaria ni
+    # portar overrides invàlids: se saneja abans de desar-lo.
+    from open_webui.collab.profiles import sanitize_overrides, sanitize_project_dir
+
+    form.config = sanitize_project_dir(form.config, is_admin=(user.role == "admin"))
+    form.agent_overrides = sanitize_overrides(form.agent_overrides)
     profile = await create_profile(user.id, form)
     return {"profile": profile}
 
@@ -332,7 +359,9 @@ async def apply_profile_to_channel(
 ):
     _check_can_manage(user)
     channel = await _get_channel_checked(request, channel_id, user, permission="write")
-    ok, cfg = await apply_profile(channel_id, profile_id, user.id)
+    ok, cfg = await apply_profile(
+        channel_id, profile_id, user.id, is_admin=(user.role == "admin")
+    )
     if not ok:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Perfil no trobat")
     return {"channel_config": cfg, "applied": True}
@@ -591,6 +620,7 @@ class CollabConfigForm(BaseModel):
 async def get_config(request: Request, channel_id: str, user=Depends(get_verified_user)):
     channel = await _get_channel_checked(request, channel_id, user)
     config = get_collab_config(channel)
+    can_manage = not admin_only() or user.role == "admin"
     return {
         **config.model_dump(),
         "active": is_round_active(channel.id),
@@ -599,8 +629,11 @@ async def get_config(request: Request, channel_id: str, user=Depends(get_verifie
         "conversation_modes": list(VALID_CONVERSATION_MODES),
         "summary": await get_summary(channel.id),
         "phase": await get_phase(channel.id),
-        "can_manage": not admin_only() or user.role == "admin",
-        "recent_dirs": await get_recent_dirs(),
+        "can_manage": can_manage,
+        # recent_dirs és estat GLOBAL (rutes usades a QUALSEVOL canal): només
+        # es filtra a qui pot triar carpeta, per no filtrar rutes del host ni
+        # activitat d'altres espais a usuaris de només-lectura.
+        "recent_dirs": await get_recent_dirs() if can_manage else [],
         "down_agents": await get_down_agents(channel.id),
         "meta_version": channel.meta_version or 0,  # W4-6: per al versionatge optimista
     }
@@ -628,6 +661,9 @@ async def update_config(
         if form_data.project_dir.strip() == "":
             config.project_dir = None
         else:
+            # Fixar una carpeta del host és una operació sensible: admin o
+            # propietari del canal, encara que el canal sigui públic amb escriptura.
+            _require_channel_manager(channel, user)
             ok, result = validate_project_dir(form_data.project_dir, is_admin=(user.role == "admin"))
             if not ok:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result)
@@ -762,7 +798,16 @@ async def open_in_vscode(request: Request, channel_id: str, user=Depends(get_ver
     Només té sentit en desplegament LOCAL (el backend i el VS Code són a la
     mateixa màquina), que és l'ús d'aquest fork. Requereix el CLI `code` al PATH."""
     _check_can_manage(user)
+    # Obrir VS Code arrenca un procés al host: només té sentit (i és segur) en
+    # mode local. En un desplegament remot seria una primitiva d'execució de
+    # processos exposada per API.
+    if not local_mode():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Obrir VS Code només està permès en mode local (COLLAB_LOCAL_MODE).",
+        )
     channel = await _get_channel_checked(request, channel_id, user)
+    _require_channel_manager(channel, user)
     config = get_collab_config(channel)
     if not config.project_dir or not os.path.isdir(config.project_dir):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Aquest espai no té carpeta-projecte")
@@ -899,11 +944,21 @@ async def browse_dirs(path: Optional[str] = None, user=Depends(get_verified_user
     """Llista subcarpetes per al selector de carpeta-projecte de la UI."""
     roots = _default_roots()
 
-    if not allowed_project_roots() and user.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Sense COLLAB_ALLOWED_ROOTS definit, només un admin pot navegar carpetes",
-        )
+    # Sense whitelist, navegar exposa TOT el sistema de fitxers del host. Només
+    # es permet en mode local (i a un admin); un desplegament compartit ha de
+    # definir COLLAB_ALLOWED_ROOTS per acotar-ho.
+    if not allowed_project_roots():
+        if not local_mode():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Navegar carpetes sense COLLAB_ALLOWED_ROOTS només es permet "
+                "en mode local (COLLAB_LOCAL_MODE). Defineix una llista d'arrels permeses.",
+            )
+        if user.role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Sense COLLAB_ALLOWED_ROOTS definit, només un admin pot navegar carpetes",
+            )
 
     if not path:
         return {

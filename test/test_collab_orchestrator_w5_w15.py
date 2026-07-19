@@ -130,8 +130,9 @@ def _setup_agent_turn_mocks(monkeypatch, *, resolved=None, circuit=True,
     monkeypatch.setattr(channels_router, "new_message_handler", new_msg)
 
     if capture_project_tree is not None:
-        def fake_project_block(config, include_tree=False):
+        def fake_project_block(config, include_tree=False, *, tree_text=None):
             capture_project_tree["include_tree"] = include_tree
+            capture_project_tree["tree_text"] = tree_text
             return ""
         monkeypatch.setattr(orchestrator, "_project_block", fake_project_block)
 
@@ -684,7 +685,7 @@ def test_tool_calling_unsupported_retries_turn_without_tools(monkeypatch):
             orchestrator, "_run_generation_until_done", fake_generation
         )
         monkeypatch.setattr(orchestrator, "_reset_response_for_retry", reset_message)
-        orchestrator._models_without_collab_tools.discard("a1")
+        orchestrator._models_without_collab_tools.pop("a1", None)
 
         result = await orchestrator.agent_turn(
             None,
@@ -699,7 +700,7 @@ def test_tool_calling_unsupported_retries_turn_without_tools(monkeypatch):
         assert COLLAB_TOOL_ID in forms[0].get("tool_ids", [])
         assert "tool_ids" not in forms[1]
         assert "a1" in orchestrator._models_without_collab_tools
-        orchestrator._models_without_collab_tools.discard("a1")
+        orchestrator._models_without_collab_tools.pop("a1", None)
 
     asyncio.run(scenario())
 
@@ -728,7 +729,7 @@ def test_empty_turn_with_tools_retries_without_tools(monkeypatch):
         monkeypatch.setattr(orchestrator, "ensure_collab_tool", fake_ensure)
         monkeypatch.setattr(orchestrator, "_run_generation_until_done", fake_generation)
         monkeypatch.setattr(orchestrator, "_reset_response_for_retry", reset_message)
-        orchestrator._models_without_collab_tools.discard("a1")
+        orchestrator._models_without_collab_tools.pop("a1", None)
 
         result = await orchestrator.agent_turn(
             None,

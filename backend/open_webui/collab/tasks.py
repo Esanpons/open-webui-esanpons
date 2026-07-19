@@ -309,10 +309,19 @@ async def get_end_proposal(channel_id: str):
     return await get_meta_key(channel_id, "collab_end_proposal", None)
 
 
-async def set_end_proposal(channel_id: str, by: str, summary: str, kind: str = "finish") -> bool:
-    """kind: 'finish' (donar la feina per acabada) o 'plan' (donar el pla per acordat)."""
+async def set_end_proposal(
+    channel_id: str, by: str, summary: str, kind: str = "finish", *, by_id: str = ""
+) -> bool:
+    """kind: 'finish' (donar la feina per acabada) o 'plan' (donar el pla per acordat).
+
+    ``by`` és el nom a mostrar (pot ser un àlies d'override); ``by_id`` és
+    l'agent_id estable, que és el que fa servir la votació per excloure el
+    proposant (comparar per nom fallava quan l'agent tenia display_name).
+    """
     return await set_meta_key(
-        channel_id, "collab_end_proposal", {"by": by, "summary": summary.strip(), "kind": kind}
+        channel_id,
+        "collab_end_proposal",
+        {"by": by, "by_id": by_id, "summary": summary.strip(), "kind": kind},
     )
 
 

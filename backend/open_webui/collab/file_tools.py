@@ -17,7 +17,7 @@ from open_webui.utils.tools import get_tool_specs
 log = logging.getLogger(__name__)
 
 COLLAB_TOOL_ID = "collab_files"
-COLLAB_TOOL_VERSION = "4"  # puja-ho quan canviï TOOL_CONTENT per forçar re-registre
+COLLAB_TOOL_VERSION = "5"  # puja-ho quan canviï TOOL_CONTENT per forçar re-registre
 
 TOOL_CONTENT = '''"""
 title: Espai col·laboratiu (fitxers + tasques)
@@ -52,6 +52,12 @@ def _channel_id(__metadata__: dict) -> str:
 def _agent_name(__metadata__: dict) -> str:
     model = (__metadata__ or {}).get("model") or {}
     return model.get("name") or model.get("id") or "agent"
+
+
+def _agent_id(__metadata__: dict) -> str:
+    """agent_id estable (model.id), per excloure el proposant a la votació."""
+    model = (__metadata__ or {}).get("model") or {}
+    return model.get("id") or ""
 
 
 def _turn_id(__metadata__: dict) -> str:
@@ -193,7 +199,10 @@ class Tools:
             locked = lock_turn_tool(turn_id, "propose_finish")
         try:
             await collab_tasks.set_end_proposal(
-                channel_id, _agent_name(__metadata__), summary
+                channel_id,
+                _agent_name(__metadata__),
+                summary,
+                by_id=_agent_id(__metadata__),
             )
             return (
                 "Proposta de tancament registrada. En acabar el teu torn, la resta "

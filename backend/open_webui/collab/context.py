@@ -18,7 +18,7 @@ async def build_transcript(channel_id: str, config: CollabConfig, models: dict) 
     """Transcripció recent del canal amb autors etiquetats (D4), en ordre
     cronològic. S'ometen les comandes /collab i els placeholders buits de
     torns en curs."""
-    limit = int(config.guardrail("context_messages") or 30)
+    limit = config.context_messages()
     messages = (await Messages.get_messages_by_channel_id(channel_id, 0, limit))[::-1]
 
     user_ids = list({m.user_id for m in messages})
@@ -55,7 +55,15 @@ def _participants_line(config: CollabConfig, models: dict, exclude: Optional[str
     return ", ".join(names) if names else "(cap altre agent)"
 
 
-def _project_block(config: CollabConfig, include_tree: bool = False) -> str:
+def _project_block(
+    config: CollabConfig, include_tree: bool = False, *, tree_text: Optional[str] = None
+) -> str:
+    """Bloc de context del projecte compartit.
+
+    ``tree_text`` permet passar l'arbre ja calculat (p. ex. des d'un thread, per
+    no bloquejar el loop amb l'I/O de disc). Si ``include_tree`` és cert i no es
+    passa ``tree_text``, es calcula en línia (comportament antic, síncron).
+    """
     if not config.project_dir:
         return ""
     text = (
@@ -71,11 +79,21 @@ def _project_block(config: CollabConfig, include_tree: bool = False) -> str:
         # Arbre curt: és una orientació, no un inventari — per a la llista
         # completa els agents tenen list_project_files(). Mantenir-lo petit
         # estalvia tokens a cada torn i evita els límits TPM dels models gratuïts.
+        if tree_text is None:
+            tree_text = tree_as_text(config.project_dir, max_entries=80)
         text += (
             "\n\nEstat actual de la carpeta (arbre de fitxers, pot estar tallat):\n"
-            + tree_as_text(config.project_dir, max_entries=80)
+            + tree_text
         )
     return text
+
+
+def project_tree_text(config: CollabConfig, max_entries: int = 80) -> str:
+    """Arbre de fitxers del projecte com a text (síncron; crida'l via to_thread
+    des del loop). Buit si no hi ha carpeta configurada."""
+    if not config.project_dir:
+        return ""
+    return tree_as_text(config.project_dir, max_entries=max_entries)
 
 
 def _collab_ctx(channel: ChannelModel, config: CollabConfig) -> dict:

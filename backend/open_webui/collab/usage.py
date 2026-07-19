@@ -142,6 +142,12 @@ def sanitize_error_detail(detail) -> str | None:
 def classify_error(raw) -> tuple[str, str | None]:
     """Classifica un error (excepció o text) en una de les 6 categories.
 
+    Aquest és el classificador CENTRAL de tots els errors de model del mòdul
+    collab. Les regex heurístiques de `orchestrator.py` (`_TOKEN_LIMIT_HINT_RE`,
+    `_TOOL_CALLING_UNSUPPORTED_RE`, `_RETRY_AFTER_RE`) governen decisions de
+    RETRY, no la classificació de status; qualsevol categoria d'estat nova ha
+    d'anar aquí. El contracte està cobert per test_collab_error_classification.
+
     Retorna (status, error_detail_sanejat). Un `raw` buit és empty_response.
     Desconegut → provider_error (mai text lliure com a status).
     """

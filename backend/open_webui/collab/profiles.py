@@ -10,7 +10,6 @@ El disseny detallat està a ``docs/disseny-w11-w12-perfils.md``.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 import uuid
@@ -127,6 +126,60 @@ def _validate_overrides(overrides: list[dict], agents: list[str]) -> list[dict]:
         else:
             log.warning("Override ignorat: model_id '%s' no és a agents %s", mid, agents)
     return valid
+
+
+def sanitize_overrides(overrides: list[dict] | None) -> list[dict]:
+    """Normalitza els overrides passant-los per AgentOverride (Pydantic).
+
+    Descarta els camps invàlids (p. ex. effort/priority fora de rang) i les
+    entrades sense model_id, en comptes de deixar-los arribar intactes al motor
+    i fer-lo fallar contra el proveïdor. Cada override rebutjat es registra.
+    """
+    if not overrides:
+        return []
+    clean: list[dict] = []
+    for ov in overrides:
+        if not isinstance(ov, dict) or not ov.get("model_id"):
+            log.warning("Override descartat (sense model_id o no és objecte): %r", ov)
+            continue
+        try:
+            model = AgentOverride(**ov)
+        except Exception:
+            log.warning("Override invàlid descartat per a model_id=%s: %r",
+                        ov.get("model_id"), ov, exc_info=True)
+            continue
+        # exclude_none: no reescriure els camps que l'usuari no ha tocat.
+        clean.append(model.model_dump(exclude_none=True))
+    return clean
+
+
+def sanitize_project_dir(config: dict | None, is_admin: bool) -> dict:
+    """Retorna una còpia de ``config`` amb ``project_dir`` revalidat.
+
+    Si la carpeta no passa ``validate_project_dir`` (no existeix o queda fora de
+    COLLAB_ALLOWED_ROOTS), s'elimina en comptes d'aplicar-la: aplicar/importar
+    un perfil no pot ser una porta del darrere per fixar una carpeta que el
+    panell rebutjaria. Retorna la config normalitzada (project_dir absolut si és
+    vàlid, o sense project_dir si no ho és).
+    """
+    from open_webui.collab.config import validate_project_dir
+
+    data = dict(config or {})
+    project_dir = (data.get("project_dir") or "").strip()
+    if not project_dir:
+        data.pop("project_dir", None)
+        return data
+    ok, result = validate_project_dir(project_dir, is_admin)
+    if ok:
+        data["project_dir"] = result  # ruta absoluta normalitzada
+    else:
+        log.warning(
+            "project_dir del perfil rebutjat i eliminat en aplicar/importar: %s (%s)",
+            project_dir,
+            result,
+        )
+        data.pop("project_dir", None)
+    return data
 
 
 def resolve_agent(agent_id: str, overrides: list[dict]) -> dict:
@@ -455,10 +508,15 @@ async def _sync_channel_meta(db, channel_id: str, config: dict) -> None:
 
 
 async def apply_profile(
-    channel_id: str, profile_id: str, user_id: str
+    channel_id: str, profile_id: str, user_id: str, *, is_admin: bool = False
 ) -> tuple[bool, Optional[dict]]:
     """Copia un perfil a collab_channel_config. El perfil original queda intacte.
-    Retorna (ok, serialized_channel_config)."""
+    Retorna (ok, serialized_channel_config).
+
+    ``is_admin`` es fa servir per revalidar ``project_dir``: aplicar un perfil no
+    pot fixar una carpeta que ``update_config`` rebutjaria (vegeu
+    ``sanitize_project_dir``).
+    """
     from open_webui.collab.tasks import replace_tasks
 
     profile = await get_profile(profile_id, user_id)
@@ -468,6 +526,9 @@ async def apply_profile(
     # La plantilla mana sobre TOT: config d'espai (agents, carpeta, mode,
     # guardrails, enabled) i tauler de tasques (si en porta).
     space_config, template_tasks = _split_template_config(profile["config"])
+    # Revalidem la carpeta (no és una porta del darrere) i normalitzem overrides.
+    space_config = sanitize_project_dir(space_config, is_admin)
+    overrides = sanitize_overrides(profile["agent_overrides"])
 
     now = int(time.time())
     async with get_async_db_context() as db:
@@ -483,7 +544,7 @@ async def apply_profile(
             c.source_profile_id = profile_id
             c.source_profile_version = profile["updated_at"]
             c.config = space_config
-            c.agent_overrides = profile["agent_overrides"]
+            c.agent_overrides = overrides
             c.budget = profile["budget"]
             c.version = existing.version + 1
             c.updated_at = now
@@ -493,7 +554,7 @@ async def apply_profile(
                 source_profile_id=profile_id,
                 source_profile_version=profile["updated_at"],
                 config=space_config,
-                agent_overrides=profile["agent_overrides"],
+                agent_overrides=overrides,
                 budget=profile["budget"],
                 version=1,
                 updated_at=now,

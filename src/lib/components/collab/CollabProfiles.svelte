@@ -29,6 +29,9 @@
 	let effective: CollabChannelConfig | null = null;
 	let selectedProfile = '';
 	let newProfileName = '';
+	// Hi ha edicions de personalització per agent sense desar? Evita que un
+	// load() (toggle, aplicar plantilla…) les descarti en silenci.
+	let dirty = false;
 
 	// Si es passa preferProfileId, es conserva aquesta plantilla al desplegable
 	// encara que el canal s'hagi desvinculat del perfil origen (cas típic just
@@ -47,6 +50,7 @@
 			} else {
 				selectedProfile = effective?.source_profile_id ?? '';
 			}
+			dirty = false; // acabem de carregar l'estat fresc del backend
 		} catch (e) {
 			toast.error(`${e}`);
 		} finally {
@@ -61,6 +65,11 @@
 	});
 
 	const toggle = async () => {
+		// No recarreguem si hi ha edicions sense desar: un load() les descartaria.
+		if (open && dirty) {
+			open = false;
+			return;
+		}
 		open = !open;
 		if (open) await load();
 	};
@@ -69,6 +78,9 @@
 	// «Plantilla predeterminada» (valor buit) restableix la config interna.
 	let applyingProfile = false;
 	const onSelectProfile = async (value: string) => {
+		if (dirty && !confirm('Tens canvis de personalització sense desar que es perdran en aplicar una plantilla. Continuar?')) {
+			return;
+		}
 		selectedProfile = value;
 		if (!canManage) return;
 		applyingProfile = true;
@@ -93,8 +105,16 @@
 	const selected = () => profiles.find((p) => p.id === selectedProfile);
 
 	const removeSelected = async () => {
-		const profile = selected(); if (!profile || !confirm(`Eliminar «${profile.name}»?`)) return;
-		await deleteCollabProfile(localStorage.token, profile.id); selectedProfile = ''; await load();
+		const profile = selected();
+		if (!profile || !confirm(`Eliminar «${profile.name}»?`)) return;
+		try {
+			await deleteCollabProfile(localStorage.token, profile.id);
+			selectedProfile = '';
+			toast.success(`Plantilla «${profile.name}» eliminada.`);
+			await load();
+		} catch (e) {
+			toast.error(`${e}`);
+		}
 	};
 
 	// Persisteix els canvis pendents de personalització al canal (pas previ de
@@ -111,6 +131,7 @@
 			version
 		});
 		effective = result.channel_config;
+		dirty = false; // ja s'han desat al canal
 	};
 
 	// «Crea nova»: fotografia COMPLETA de l'estat actual (agents, carpeta,
@@ -207,6 +228,7 @@
 			...effective,
 			agent_overrides: [...effective.agent_overrides.filter((o) => o.model_id !== agentId), next]
 		};
+		dirty = true;
 	};
 
 </script>
@@ -292,7 +314,8 @@
 						</div>
 					</div>
 				{/each}
-					<p class="text-xs text-gray-500">
+					<p class="text-xs {dirty ? 'text-amber-600 dark:text-amber-500 font-medium' : 'text-gray-500'}">
+					{#if dirty}⚠️ Tens canvis sense desar.{/if}
 					Els canvis d'aquesta secció es desen amb el botó «💾 Desa» de Plantilles.
 				</p>
 			</div>

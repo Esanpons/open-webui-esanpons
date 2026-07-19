@@ -54,8 +54,9 @@ El cicle complet d'un objectiu: 📋 planificar → vot del pla → 🔨 executa
 | `allow_self_reply` | on | Permetre dos torns seguits del mateix agent |
 | `turn_timeout` | 900 s | Temps màxim d'un torn |
 | `handraise_timeout` | 180 s | Temps màxim de les crides curtes (mà alçada, vot, resum) |
-| `context_messages` | 30 | Missatges recents passats com a context (canviable en qualsevol moment; per a l'historial COMPLET els agents tenen `read_conversation`/`search_conversation`) |
-| `auto_summary` | off | Resum incremental en acabar cada sessió (1 crida extra) |
+| `context_messages` | 15 | Missatges recents passats com a context (0 = usa el default, no desactiva; per a l'historial COMPLET els agents tenen `read_conversation`/`search_conversation`) |
+| `handraise_context_messages` | 8 | Context (més curt) per a la decisió de mà alçada; 0 = reutilitza `context_messages` |
+| `auto_summary` | on | Resum incremental en acabar cada sessió (1 crida extra) |
 | `max_round_seconds` | 0 | Durada màxima d'una ronda sencera |
 
 ## Instal·lació nova: què cal activar {#installacio-nova-que-cal-activar}

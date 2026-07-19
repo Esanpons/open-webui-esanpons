@@ -5,9 +5,6 @@ from open_webui.models.messages import MessageForm, Messages
 
 
 _turn_cancellables: dict[str, dict] = {}
-# Conservat com a re-export de compatibilitat. El timeout ja no té un sostre
-# ocult: el guardrail del canal és l'única font de veritat.
-_HARD_TURN_TIMEOUT = 600
 
 
 def active_turn_id(channel_id: str) -> str | None:
@@ -70,12 +67,48 @@ def _effective_turn_timeout(config: CollabConfig) -> int | None:
     return configured if configured > 0 else None
 
 
+async def cleanup_orphan_turn_messages(channel_id: str, *, limit: int = 50) -> int:
+    """Tanca els placeholders de torn orfes ("⏳ *treballant…*" amb done=False).
+
+    Després d'un crash a mig torn, aquests missatges queden penjats i la UI
+    mostra un agent "parlant" per sempre. En arrencar una ronda nova es marquen
+    com a interromputs. Retorna quants se n'han netejat.
+
+    Nota: no toquem missatges d'un torn REALMENT actiu perquè aquesta funció
+    només es crida en adquirir el lease (moment en què no hi ha cap torn viu
+    d'aquest worker per aquest canal).
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+    cleaned = 0
+    try:
+        messages = await Messages.get_messages_by_channel_id(channel_id, 0, limit)
+    except Exception:
+        log.warning("No s'han pogut llegir els missatges de %s per netejar orfes",
+                    channel_id, exc_info=True)
+        return 0
+    for message in messages:
+        meta = message.meta or {}
+        if meta.get("model_id") and not meta.get("done"):
+            try:
+                await _mark_cancelled_message(message.id, "interrupted")
+                cleaned += 1
+            except Exception:
+                log.warning("No s'ha pogut netejar el placeholder orfe %s",
+                            message.id, exc_info=True)
+    if cleaned:
+        log.info("Netejats %d placeholders de torn orfes al canal %s", cleaned, channel_id)
+    return cleaned
+
+
 async def _mark_cancelled_message(message_id: str, reason: str) -> None:
     labels = {
         "user_requested": "cancel·lat per l'usuari",
         "timeout": "cancel·lat per timeout",
         "preempted": "cancel·lat per un missatge nou",
         "lease_lost": "interromput en perdre el lease",
+        "interrupted": "interromput (reinici del servidor)",
     }
     label = labels.get(reason, f"cancel·lat ({reason})")
     message = await Messages.get_message_by_id(message_id)

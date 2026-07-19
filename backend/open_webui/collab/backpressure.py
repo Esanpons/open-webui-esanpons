@@ -36,16 +36,37 @@ _max_concurrent = DEFAULT_MAX_CONCURRENT
 _max_per_provider = DEFAULT_MAX_PER_PROVIDER
 
 
+def _has_inflight() -> bool:
+    """Hi ha alguna adquisició en vol (algun semàfor amb valor < màxim)?"""
+    if _global_semaphore is not None and getattr(_global_semaphore, "_value", _max_concurrent) < _max_concurrent:
+        return True
+    for sem in _provider_semaphores.values():
+        if getattr(sem, "_value", _max_per_provider) < _max_per_provider:
+            return True
+    return False
+
+
 def configure(
     *,
     max_concurrent: int = DEFAULT_MAX_CONCURRENT,
     max_per_provider: int = DEFAULT_MAX_PER_PROVIDER,
 ) -> None:
-    """Configura els límits.  Ha de cridar-se abans del primer ús (p. ex. a l'arrencada).
+    """Configura els límits. Pensada per cridar-se ABANS del primer ús (arrencada).
 
-    Si ja hi ha semàfors creats, es reconstrueixen amb els nous valors.
+    Reconstruir els semàfors amb adquisicions EN VOL enviaria els release() als
+    objectes antics i deixaria els nous buits, superant transitòriament els
+    límits. Per això, si hi ha alguna adquisició activa, s'avisa i NO es toca
+    res; en repòs (arrencada, o entre tests) es reconstrueix amb seguretat.
     """
     global _global_semaphore, _max_concurrent, _max_per_provider
+    if _has_inflight():
+        log.warning(
+            "Backpressure amb crides en vol; s'ignora la reconfiguració en calent "
+            "(%d/%d) per no superar els límits",
+            max_concurrent,
+            max_per_provider,
+        )
+        return
     _max_concurrent = max_concurrent
     _max_per_provider = max_per_provider
     _global_semaphore = asyncio.Semaphore(max_concurrent)
@@ -128,15 +149,20 @@ async def acquire(model_id: str = ""):
     provider = _provider_prefix(model_id)
     provider_sem = _get_provider_semaphore(provider)
 
-    await global_sem.acquire()
+    # Provider-first: adquirim el semàfor del proveïdor ABANS del global. Així,
+    # quan un proveïdor està saturat, les crides s'esperen al seu propi
+    # semàfor sense ocupar cap slot global — altres proveïdors segueixen
+    # avançant (evita el head-of-line blocking on N crides a un sol proveïdor
+    # lent consumien tot el cupo global).
+    await provider_sem.acquire()
     try:
-        await provider_sem.acquire()
+        await global_sem.acquire()
         try:
             yield
         finally:
-            provider_sem.release()
+            global_sem.release()
     finally:
-        global_sem.release()
+        provider_sem.release()
 
 
 def stats() -> dict:

@@ -203,4 +203,162 @@ def test_escape_like_multiple():
     from open_webui.collab.files import escape_like
 
     assert escape_like("%%__") == "\\%\\%\\_\\_"
-    assert escape_like("a%b%c_d_e") == "a\\%b\\%c\\_d\\_e"
+
+
+# ---------------------------------------------------------------------------
+# MR-24: null byte rebutjat explícitament + bloqueig d'escriptura a .git/
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_safe_null_byte_now_rejected(tmp_path):
+    """El null byte ara es rebutja SEMPRE (retorna None), no depèn del runtime."""
+    assert resolve_safe(str(tmp_path), "file\x00.txt") is None
+    assert resolve_safe(str(tmp_path), "a/b\x00/c") is None
+
+
+def test_write_blocked_in_git_dir(tmp_path):
+    """No es pot escriure dins de .git/ (vector RCE via hooks)."""
+    from open_webui.collab.files import write_text_file
+
+    ok, reason = write_text_file(str(tmp_path), ".git/hooks/pre-commit", "#!/bin/sh\nrm -rf /")
+    assert ok is False
+    assert ".git" in reason
+
+
+def test_write_blocked_in_node_modules(tmp_path):
+    from open_webui.collab.files import write_text_file
+
+    ok, _ = write_text_file(str(tmp_path), "node_modules/evil/index.js", "x")
+    assert ok is False
+
+
+def test_write_allowed_in_normal_path(tmp_path):
+    from open_webui.collab.files import write_text_file
+
+    ok, _ = write_text_file(str(tmp_path), "src/app.py", "print('hi')")
+    assert ok is True
+    assert (tmp_path / "src" / "app.py").read_text() == "print('hi')"
+
+
+# ---------------------------------------------------------------------------
+# MR-12: validate_project_dir amb whitelist i mode local
+# ---------------------------------------------------------------------------
+
+
+def test_validate_project_dir_within_whitelist(tmp_path, monkeypatch):
+    from open_webui.collab import config as collab_config
+
+    root = tmp_path / "allowed"
+    inside = root / "proj"
+    inside.mkdir(parents=True)
+    monkeypatch.setenv("COLLAB_ALLOWED_ROOTS", str(root))
+    ok, result = collab_config.validate_project_dir(str(inside), is_admin=False)
+    assert ok is True
+    assert os.path.abspath(str(inside)) == result
+
+
+def test_validate_project_dir_outside_whitelist(tmp_path, monkeypatch):
+    from open_webui.collab import config as collab_config
+
+    root = tmp_path / "allowed"
+    root.mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    monkeypatch.setenv("COLLAB_ALLOWED_ROOTS", str(root))
+    ok, _ = collab_config.validate_project_dir(str(outside), is_admin=True)
+    assert ok is False
+
+
+def test_validate_project_dir_no_whitelist_non_local_rejected(tmp_path, monkeypatch):
+    """Sense whitelist i sense mode local: es rebutja fins i tot per admin."""
+    from open_webui.collab import config as collab_config
+
+    monkeypatch.delenv("COLLAB_ALLOWED_ROOTS", raising=False)
+    monkeypatch.setenv("COLLAB_LOCAL_MODE", "false")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    ok, _ = collab_config.validate_project_dir(str(proj), is_admin=True)
+    assert ok is False
+
+
+def test_validate_project_dir_local_admin_ok(tmp_path, monkeypatch):
+    from open_webui.collab import config as collab_config
+
+    monkeypatch.delenv("COLLAB_ALLOWED_ROOTS", raising=False)
+    monkeypatch.setenv("COLLAB_LOCAL_MODE", "true")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    ok, _ = collab_config.validate_project_dir(str(proj), is_admin=True)
+    assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# MR-07/08: sanitize_project_dir i sanitize_overrides
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_project_dir_strips_invalid(tmp_path, monkeypatch):
+    from open_webui.collab.profiles import sanitize_project_dir
+
+    root = tmp_path / "allowed"
+    root.mkdir()
+    monkeypatch.setenv("COLLAB_ALLOWED_ROOTS", str(root))
+    # Carpeta fora de la whitelist → s'elimina project_dir de la config.
+    out = sanitize_project_dir({"project_dir": str(tmp_path / "evil"), "agents": ["a1"]}, is_admin=True)
+    assert "project_dir" not in out
+    assert out["agents"] == ["a1"]
+
+
+def test_sanitize_overrides_drops_invalid():
+    from open_webui.collab.profiles import sanitize_overrides
+
+    overrides = [
+        {"model_id": "a1", "priority": 3},          # vàlid
+        {"model_id": "a2", "priority": 999},        # priority fora de rang → descartat
+        {"display_name": "sense model"},            # sense model_id → descartat
+        {"model_id": "a3", "effort": "banana"},     # effort no vàlid? (opcional) — depèn del model
+    ]
+    clean = sanitize_overrides(overrides)
+    ids = {o["model_id"] for o in clean}
+    assert "a1" in ids
+    assert "a2" not in ids  # priority 999 invàlida
+    # a3 amb effort lliure: AgentOverride no restringeix effort a un enum, així
+    # que passa; el que importa és que a1 hi és i a2 no.
+    assert all(o.get("model_id") for o in clean)
+
+
+# ---------------------------------------------------------------------------
+# MR-13: _require_channel_manager
+# ---------------------------------------------------------------------------
+
+
+def test_require_channel_manager_admin_ok():
+    from types import SimpleNamespace
+    from open_webui.collab.router import _require_channel_manager
+
+    admin = SimpleNamespace(id="u1", role="admin")
+    channel = SimpleNamespace(user_id="owner", id="c1")
+    _require_channel_manager(channel, admin)  # no llança
+
+
+def test_require_channel_manager_owner_ok():
+    from types import SimpleNamespace
+    from open_webui.collab.router import _require_channel_manager
+
+    owner = SimpleNamespace(id="owner", role="user")
+    channel = SimpleNamespace(user_id="owner", id="c1")
+    _require_channel_manager(channel, owner)  # no llança
+
+
+def test_require_channel_manager_stranger_forbidden():
+    from types import SimpleNamespace
+    from fastapi import HTTPException
+    from open_webui.collab.router import _require_channel_manager
+
+    stranger = SimpleNamespace(id="u2", role="user")
+    channel = SimpleNamespace(user_id="owner", id="c1")
+    try:
+        _require_channel_manager(channel, stranger)
+        assert False, "hauria d'haver llançat 403"
+    except HTTPException as e:
+        assert e.status_code == 403

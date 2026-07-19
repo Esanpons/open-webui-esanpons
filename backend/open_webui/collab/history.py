@@ -10,6 +10,7 @@ cosa antiga, fa servir aquestes funcions via les eines `read_conversation` /
 import json
 import logging
 
+from open_webui.collab.files import escape_like
 from open_webui.internal.db import get_async_db_context
 from open_webui.models.messages import Message
 from open_webui.models.users import Users
@@ -97,7 +98,7 @@ async def search_conversation(channel_id: str, query: str, limit: int = 20) -> s
         result = await db.execute(
             select(Message)
             .filter(Message.channel_id == channel_id)
-            .filter(Message.content.ilike(f"%{query}%"))
+            .filter(Message.content.ilike(f"%{escape_like(query)}%", escape="\\"))
             .order_by(Message.created_at.desc())
             .limit(limit)
         )

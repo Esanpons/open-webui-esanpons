@@ -47,6 +47,11 @@ _ATOMIC_TMP_SUFFIX = ".tmp"
 def resolve_safe(project_dir: str, relative: str = ".") -> Optional[Path]:
     """Resol `relative` DINS de project_dir. Retorna None si s'escapa
     (.. , rutes absolutes fora, symlinks fora...)."""
+    # Rebutgem explícitament els null bytes: Path.resolve() ja llança amb ells a
+    # les versions actuals de Python, però no ho volem deixar a l'atzar del
+    # runtime (vegeu el test test_resolve_safe_null_byte).
+    if relative and "\x00" in relative:
+        return None
     try:
         root = Path(project_dir).resolve()
         target = (root / (relative or ".")).resolve()
@@ -55,6 +60,23 @@ def resolve_safe(project_dir: str, relative: str = ".") -> Optional[Path]:
         return None
     except (OSError, ValueError):
         return None
+
+
+def _forbidden_component(project_dir: str, target: Path) -> Optional[str]:
+    """Retorna el primer component de la ruta (relativa a l'arrel) que estigui a
+    IGNORED_DIRS, o None si no n'hi ha cap. Serveix per bloquejar ESCRIPTURES a
+    llocs perillosos (p. ex. `.git/hooks/pre-commit` → RCE al proper commit),
+    que `resolve_safe` sí que permet perquè hi són dins de l'arrel.
+    """
+    try:
+        root = Path(project_dir).resolve()
+        rel = target.resolve().relative_to(root)
+    except (OSError, ValueError):
+        return None
+    for part in rel.parts:
+        if part in IGNORED_DIRS:
+            return part
+    return None
 
 
 def escape_like(value: str | None) -> str:
@@ -159,6 +181,13 @@ def write_text_file(project_dir: str, relative: str, content: str) -> tuple[bool
         return False, f"Ruta fora del projecte: {relative}"
     if target.is_dir():
         return False, f"És una carpeta: {relative}"
+
+    # Bloquejar escriptures dins de carpetes reservades (.git, node_modules...):
+    # resolve_safe les permet perquè hi són dins de l'arrel, però escriure a
+    # `.git/hooks/*` és un vector d'execució de codi al proper commit.
+    forbidden = _forbidden_component(project_dir, target)
+    if forbidden:
+        return False, f"Escriptura no permesa dins de `{forbidden}/`: {relative}"
 
     # S7: límit de mida del contingut.
     data = content.encode("utf-8")

@@ -126,11 +126,6 @@ def fallback_avatar(name: str) -> str:
     return name.strip()[0].upper()
 
 
-def fallback_role() -> Optional[str]:
-    """Sense rol per defecte."""
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Resolució d'identitat
 # ---------------------------------------------------------------------------

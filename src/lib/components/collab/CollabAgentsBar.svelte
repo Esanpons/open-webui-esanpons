@@ -4,11 +4,16 @@
 	// (receipts: received → evaluating → will_intervene/pass), alimentada pel
 	// socket `events:channel` (envelope collab_event.v1) amb re-sync via REST
 	// (`GET /events?since=` + `GET /receipts/{seq}`) si el socket falla.
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { toast } from 'svelte-sonner';
 
 	import { models, socket } from '$lib/stores';
-	import { setCollabRounds, type CollabRound } from '$lib/stores/collab';
+	import {
+		setCollabRounds,
+		clearCollabRounds,
+		COLLAB_STATE_INFO,
+		type CollabRound
+	} from '$lib/stores/collab';
 	import {
 		cancelCollabTurn,
 		getCollabAgentIdentities,
@@ -47,37 +52,8 @@
 	let resyncInterval: ReturnType<typeof setInterval> | null = null;
 	const FALLBACK_RESYNC_MS = 90_000;
 
-	const STATE_INFO: Record<
-		string,
-		{ icon: string; label: string; classes: string; pulse?: boolean }
-	> = {
-		received: {
-			icon: '📨',
-			label: 'ha rebut el missatge',
-			classes: 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300'
-		},
-		incorporated: {
-			icon: '📥',
-			label: 'ha incorporat el context',
-			classes: 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300'
-		},
-		evaluating: {
-			icon: '🤔',
-			label: 'està valorant si intervé',
-			classes: 'bg-amber-100 text-amber-700 dark:bg-amber-900/60 dark:text-amber-300',
-			pulse: true
-		},
-		will_intervene: {
-			icon: '✋',
-			label: 'intervindrà',
-			classes: 'bg-blue-100 text-blue-700 dark:bg-blue-900/60 dark:text-blue-300'
-		},
-		pass: {
-			icon: '💤',
-			label: 'passa aquest torn',
-			classes: 'bg-gray-100 text-gray-400 dark:bg-gray-850 dark:text-gray-500'
-		}
-	};
+	// Font única de veritat dels estats (vegeu stores/collab.ts).
+	const STATE_INFO = COLLAB_STATE_INFO;
 
 	const modelName = (id: string) => $models.find((m) => m.id === id)?.name ?? id;
 	const identityFor = (id: string) => identities[id];
@@ -109,7 +85,23 @@
 		}
 	};
 
+	// Límit de rondes en memòria: `rounds` i `seqToMessageId` creixien sense
+	// fita en canals veterans. Conservem només les MAX_ROUNDS més recents (per
+	// seq); la franja W9 només mostra les últimes visibles.
+	const MAX_ROUNDS = 100;
+	const pruneRounds = () => {
+		const entries = Object.entries(rounds);
+		if (entries.length <= MAX_ROUNDS) return;
+		const keep = entries.sort(([, a], [, b]) => b.seq - a.seq).slice(0, MAX_ROUNDS);
+		const keptSeqs = new Set(keep.map(([, r]) => r.seq));
+		rounds = Object.fromEntries(keep);
+		for (const [seq, mid] of Object.entries(seqToMessageId)) {
+			if (!keptSeqs.has(Number(seq))) delete seqToMessageId[Number(seq)];
+		}
+	};
+
 	const publishRounds = () => {
+		pruneRounds();
 		rounds = { ...rounds };
 		setCollabRounds(channelId, rounds);
 	};
@@ -199,13 +191,24 @@
 			if (turnSpeaker !== undefined) speakingAgentId = turnSpeaker;
 			if (latestUserSeq !== null && latestUserSeq !== 0) {
 				const res = await getCollabReceipts(localStorage.token, channelId, latestUserSeq);
-				currentSeq = latestUserSeq;
-				agentStates = Object.fromEntries((res?.receipts ?? []).map((r) => [r.agent_id, r.state]));
-				summary = res?.summary ?? {};
+				// Anti-regressió: si mentre esperàvem els awaits ha arribat per
+				// socket un user_message MÉS NOU (currentSeq ja és més gran), no
+				// pisem la ronda vigent amb la vella. La franja per-missatge sí
+				// que es corregeix (és per seq), però currentSeq/agentStates no
+				// han de retrocedir.
+				if (currentSeq === null || latestUserSeq >= currentSeq) {
+					currentSeq = latestUserSeq;
+					agentStates = Object.fromEntries((res?.receipts ?? []).map((r) => [r.agent_id, r.state]));
+					summary = res?.summary ?? {};
+				}
 				// els receipts REST són la font autoritzada per a l'última ronda
 				const messageId = seqToMessageId[latestUserSeq];
 				if (messageId && rounds[messageId]) {
-					rounds[messageId] = { seq: latestUserSeq, states: { ...agentStates }, summary };
+					rounds[messageId] = {
+						seq: latestUserSeq,
+						states: Object.fromEntries((res?.receipts ?? []).map((r) => [r.agent_id, r.state])),
+						summary: res?.summary ?? {}
+					};
 				}
 			}
 			publishRounds();
@@ -266,6 +269,9 @@
 			$socket?.off('events:channel', channelEventHandler);
 			document.removeEventListener('visibilitychange', refreshWhenVisible);
 			if (resyncInterval) clearInterval(resyncInterval);
+			// Allibera les rondes d'aquest canal del store perquè no s'acumulin
+			// receipts de tots els canals visitats durant la sessió.
+			clearCollabRounds(channelId);
 		};
 	});
 

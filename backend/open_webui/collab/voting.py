@@ -16,22 +16,49 @@ async def _vote_on_proposal(
     (consens, a_favor, en_contra). El proposant no vota; si és l'únic agent,
     consens automàtic. Empat o cap vot vàlid = NO consens (la feina continua)."""
     from open_webui.collab.orchestrator import _quick_completion
+    import json
     import re
 
     proposer = proposal.get("by", "")
+    proposer_id = proposal.get("by_id", "")
     summary = proposal.get("summary", "")
     kind = proposal.get("kind", "finish")
     down = await get_down_agents(channel.id)
-    voters = [
-        a for a in config.agents if models.get(a, {}).get("name", a) != proposer and a not in down
-    ]
+
+    def _is_proposer(agent_id: str) -> bool:
+        # El proposant no vota. Es compara per agent_id estable; només si la
+        # proposta és antiga (sense by_id) es recorre al nom com a compatibilitat.
+        if proposer_id:
+            return agent_id == proposer_id
+        return models.get(agent_id, {}).get("name", agent_id) == proposer
+
+    voters = [a for a in config.agents if not _is_proposer(a) and a not in down]
     if not voters:
         return True, 0, 0
 
     transcript = await build_transcript(channel.id, config, models)
     board = await _board_text(channel.id)
 
+    _json_block_re = re.compile(r"\{[^{}]*\}", re.DOTALL)
     _agree_re = re.compile(r'"agree"\s*:\s*(true|false)', re.IGNORECASE)
+
+    def _parse_vote(content: str) -> bool | None:
+        """Vot = últim bloc JSON vàlid amb 'agree' (la conclusió, no el primer
+        match d'un raonament); si no n'hi ha, l'últim match textual."""
+        result = None
+        for block in _json_block_re.findall(content):
+            try:
+                data = json.loads(block)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(data, dict) and "agree" in data:
+                result = bool(data["agree"])
+        if result is not None:
+            return result
+        matches = _agree_re.findall(content)
+        if matches:
+            return matches[-1].lower() == "true"
+        return None
 
     async def vote_one(agent_id: str):
         name = models.get(agent_id, {}).get("name", agent_id)
@@ -63,11 +90,25 @@ async def _vote_on_proposal(
         content = await _quick_completion(request, user, channel, config, agent_id, system, prompt, "vote")
         if content is None:
             return None
-        match = _agree_re.search(content)
-        return match.group(1).lower() == "true" if match else None
+        return _parse_vote(content)
 
     import asyncio
-    votes = await asyncio.gather(*[vote_one(a) for a in voters])
+    import logging
+
+    raw_votes = await asyncio.gather(
+        *[vote_one(a) for a in voters], return_exceptions=True
+    )
+    votes = []
+    for agent_id, v in zip(voters, raw_votes):
+        if isinstance(v, BaseException):
+            logging.getLogger(__name__).warning(
+                "Vot de %s ha llançat una excepció; es compta com a abstenció",
+                agent_id,
+                exc_info=v,
+            )
+            votes.append(None)
+        else:
+            votes.append(v)
     agrees = sum(1 for v in votes if v is True)
     disagrees = sum(1 for v in votes if v is False)
     return (agrees > disagrees), agrees, disagrees
